@@ -1,0 +1,17 @@
+TICKERS = {
+    "SP500": "^GSPC",
+    "Gold": "GC=F",
+    "Silver": "SI=F",
+    "Nasdaq": "^NDX",
+    "Bitcoin": "BTC-USD",
+    "Ger40": "^GDAXI",
+    "Platinum": "PL=F",
+    "Palladium": "PA=F",    # one of the most extreme sustained commodity trends in recent history                     # (2016-2022), but thinner liquidity/history than the others -- verify carefully
+    "Copper": "HG=F",
+    "Nikkei225": "^N225",
+    "Russell2000": "^RUT",
+    "Dow": "^DJI",
+    "CrudeOil": "CL=F",
+    "Corn": "ZC=F",
+    "Cocoa": "CC=F",# industrial-demand-driven, a genuinely different character than gold/silver
+}

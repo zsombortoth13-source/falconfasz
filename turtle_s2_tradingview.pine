@@ -1,0 +1,529 @@
+// =============================================================================
+// Turtle S2 (Dual System) -- ported from turtle_dual_system.py
+// =============================================================================
+// Faithful port of the S2 (slow trend) breakout system: ATR-based risk sizing,
+// pyramiding (3 methods), 4 stop mechanisms, scale-out TP, time stop, regime
+// scale-out, entry filters, drawdown scaling, cooldown. S1 was intentionally
+// left out of this script (per your own choice) -- duplicate this file with S1's
+// own defaults if you want that too.
+//
+// KNOWN, DELIBERATE DIFFERENCES FROM THE PYTHON ENGINE (read before trusting
+// numbers 1:1 against the Streamlit backtest):
+//   1. Stop/trailing/chandelier exits use Pine's OWN native stop-order broker
+//      emulation (strategy.exit(..., stop=...)) instead of a manual low[i]<=X
+//      check. This is a genuine UPGRADE, not a downgrade -- TradingView's
+//      emulator already fills at the bar's OPEN when price gaps through the
+//      stop overnight, which is exactly the gap-realism fix I just added to
+//      the Python engine, done natively and more robustly here.
+//   2. When stop / trailing-stop / chandelier are simultaneously breached on
+//      the same bar, this script exits at whichever level is CLOSEST to price
+//      (math.max of the active levels, for a long) rather than the Python
+//      engine's fixed priority order (always the fixed stop's own level).
+//      Daily bars can't know the true intrabar sequence either way -- this is
+//      a different, equally defensible convention, not a bug. Expect small
+//      differences specifically on days where more than one would have fired.
+//   3. Slippage/spread (SLIPPAGE_PCT/SPREAD_PCT in Python, ~0.02% each) are
+//      NOT separately modeled here -- only commission (mapped directly to
+//      TradingView's own percent commission). At these tiny magnitudes the
+//      effect on results is negligible; add a few ticks via the strategy's
+//      own "Slippage" setting in Properties if you want an approximation.
+//   4. HOLDING_COST_PCT_PER_YEAR (daily financing cost on leveraged notional)
+//      has no native TradingView equivalent and is NOT modeled. If you're
+//      testing with MAX_TOTAL_EXPOSURE_PCT well above 100%, real leveraged
+//      financing costs are real and this script will look better than reality
+//      by that amount, compounded daily.
+//   5. MAX_PORTFOLIO_RISK_PCT (shared risk cap across many assets at once) is
+//      a Python-only, multi-asset concept -- irrelevant to a single-symbol
+//      Pine strategy, so it's not included.
+//   6. All-time-high filter uses only this chart's own loaded history (same
+//      fallback behavior Python uses when no external full-history reference
+//      is supplied) -- load more history (or a longer timeframe) if you need
+//      it to look back further than what's currently on screen.
+// =============================================================================
+
+//@version=5
+strategy("Turtle S2 (Dual System)", shorttitle="Turtle-S2", overlay=true,
+     initial_capital=10000, currency=currency.USD,
+     default_qty_type=strategy.cash, default_qty_value=100,
+     commission_type=strategy.commission.percent, commission_value=0.01,
+     slippage=0, pyramiding=20, process_orders_on_close=true,
+     max_bars_back=5000, max_boxes_count=500, max_lines_count=500)
+// pyramiding=20 must be a compile-time literal in Pine (can't reference the maxUnitsPerTrend
+// input) -- that input is capped at maxval=20 below to match, so it can never silently ask for
+// more concurrent units than this strategy() declaration actually allows.
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+grpEntry = "Entry Signal"
+breakoutLookback   = input.int(300, "Breakout lookback (days)", minval=2, group=grpEntry)
+exitLookback       = input.int(20, "Exit lookback (days)", minval=2, group=grpEntry)
+entryBufferNMult   = input.float(0.25, "Entry buffer (x N)", minval=0.0, step=0.05, group=grpEntry)
+nAtrPeriod         = input.int(30, "N (ATR) period", minval=2, group=grpEntry)
+
+grpSize = "Position Sizing"
+riskPct              = input.float(3.0, "Risk per trade (%)", minval=0.05, step=0.05, group=grpSize)
+useRiskSchedule      = input.bool(false, "Use graduated risk schedule by unit #", group=grpSize)
+riskUnit1            = input.float(0.5, "  Unit 1 risk (%)", group=grpSize)
+riskUnit2            = input.float(1.0, "  Unit 2 risk (%)", group=grpSize)
+riskUnit3Plus        = input.float(1.5, "  Unit 3+ risk (%)", group=grpSize)
+maxTotalExposurePct  = input.float(5000.0, "Max total exposure (% of equity)", minval=1, group=grpSize)
+useDrawdownScaling   = input.bool(false, "Drawdown-based risk scaling", group=grpSize)
+ddScalingThresholdPct = input.float(10.0, "  Drawdown scaling threshold (%)", group=grpSize)
+ddScalingFactor      = input.float(0.5, "  Drawdown scaling factor", group=grpSize)
+
+grpPyr = "Pyramiding"
+pyramidMethod           = input.string("spacing", "Pyramid method", options=["spacing", "breakout", "swing_high"], group=grpPyr)
+pyramidSpacingNMult     = input.float(0.25, "  Spacing: add every X * N", group=grpPyr)
+pyramidBreakoutLookback = input.int(5, "  Breakout: fresh-high lookback (days)", group=grpPyr)
+swingLookback           = input.int(15, "  Swing-high: bars each side to confirm", group=grpPyr)
+maxUnitsPerTrend        = input.int(3, "Max units per trend", minval=1, maxval=20, group=grpPyr)
+usePyramidAdxFilter     = input.bool(false, "Block adds above ADX threshold", group=grpPyr)
+pyramidMaxAdx           = input.float(35.0, "  Max ADX to allow an add", group=grpPyr)
+ratchetStopOnPyramid    = input.bool(true, "Ratchet stop tighter on each add", group=grpPyr)
+useAverageEntryStop     = input.bool(false, "Anchor ratchet to average entry (not latest)", group=grpPyr)
+
+grpStop = "Stops"
+stopNMult               = input.float(1.5, "Stop (x N)", minval=0.1, group=grpStop)
+useFixedStop             = input.bool(true, "Fixed ratcheting stop (core SL)", group=grpStop)
+useNDayLowTrailingStop   = input.bool(true, "N-day-low trailing stop", group=grpStop)
+trailingStopLookback     = input.int(20, "  Trailing stop lookback (days)", group=grpStop)
+useBreakevenStop         = input.bool(true, "Breakeven stop", group=grpStop)
+breakevenTriggerR        = input.float(1.5, "  Breakeven trigger (R)", group=grpStop)
+useChandelierExit        = input.bool(true, "Chandelier exit", group=grpStop)
+chandelierAtrMult        = input.float(5.0, "  Chandelier (x ATR)", group=grpStop)
+
+grpTp = "Take-Profit / Time Exits"
+tpAtrPeriod         = input.int(20, "TP's own ATR period", group=grpTp)
+useScaleOut          = input.bool(true, "Scale-out at fixed R levels", group=grpTp)
+scaleOutR1           = input.float(2.0, "  Level 1: R multiple", group=grpTp)
+scaleOutFrac1Pct     = input.float(33.3, "  Level 1: % of unit's INITIAL size", group=grpTp)
+scaleOutR2           = input.float(4.0, "  Level 2: R multiple", group=grpTp)
+scaleOutFrac2Pct     = input.float(33.3, "  Level 2: % of unit's INITIAL size", group=grpTp)
+useTimeStop          = input.bool(false, "Time stop", group=grpTp)
+timeStopDays         = input.int(10, "  Time stop days", group=grpTp)
+timeStopMinR         = input.float(0.25, "  Min R required by then", group=grpTp)
+useRegimeScaleOut    = input.bool(false, "Regime-triggered scale-out (ADX spike)", group=grpTp)
+regimeAdxThresholdIn = input.float(35.0, "  Regime scale-out ADX threshold", group=grpTp)
+regimeScaleOutFracPct = input.float(50.0, "  Regime scale-out (% of remaining)", group=grpTp)
+adxPeriod            = input.int(30, "ADX period (regime scale-out)", group=grpTp)
+
+grpFilt = "Entry Filters"
+useEmaFilter         = input.bool(true, "EMA trend filter", group=grpFilt)
+emaPeriod            = input.int(300, "  EMA period", group=grpFilt)
+useChoppinessFilter  = input.bool(false, "Choppiness Index filter", group=grpFilt)
+choppinessPeriod     = input.int(14, "  Choppiness period", group=grpFilt)
+choppinessMax        = input.float(38.2, "  Max Choppiness Index", group=grpFilt)
+requireAllTimeHigh   = input.bool(false, "Require genuine all-time high", group=grpFilt)
+useCooldown          = input.bool(true, "Cooldown after a loss", group=grpFilt)
+cooldownDays         = input.int(15, "  Cooldown days", group=grpFilt)
+
+grpPlot = "Chart Display"
+showLevels = input.bool(false, "Show stop/breakout/exit level lines (heavier to render)", group=grpPlot)
+showPositionBoxes = input.bool(true, "Show entry/SL/TP position boxes (like the Python Trade Chart tab)", group=grpPlot)
+
+// ============================================================================
+// INDICATORS  (all use ta.rma == Wilder smoothing == Python's ewm(alpha=1/period),
+// and ta.highest(src[1], N) == Python's .rolling(N).max().shift(1) -- same
+// lookahead-avoidance convention used throughout turtle_dual_system.py)
+// ============================================================================
+n        = ta.atr(nAtrPeriod)
+tpN      = ta.atr(tpAtrPeriod)          // TP's OWN N, independent of the stop's N
+trueRangeVal = ta.tr(true)
+
+f_adx(length) =>
+    upMove   = ta.change(high)
+    downMove = -ta.change(low)
+    plusDM   = (upMove > downMove and upMove > 0) ? upMove : 0.0
+    minusDM  = (downMove > upMove and downMove > 0) ? downMove : 0.0
+    atrVal   = ta.rma(trueRangeVal, length)
+    plusDI   = 100 * ta.rma(plusDM, length) / atrVal
+    minusDI  = 100 * ta.rma(minusDM, length) / atrVal
+    dx       = 100 * math.abs(plusDI - minusDI) / (plusDI + minusDI)
+    ta.rma(dx, length)
+
+adxVal = f_adx(adxPeriod)
+
+f_choppiness(length) =>
+    trSum     = math.sum(trueRangeVal, length)
+    rangeHigh = ta.highest(high, length)
+    rangeLow  = ta.lowest(low, length)
+    100 * math.log10(trSum / (rangeHigh - rangeLow)) / math.log10(length)
+
+choppinessVal = f_choppiness(choppinessPeriod)
+emaTrend      = ta.ema(close, emaPeriod)
+
+breakoutLevel         = ta.highest(close[1], breakoutLookback)
+exitLowLevel          = ta.lowest(low[1], exitLookback)
+pyramidBreakoutLevel  = ta.highest(close[1], pyramidBreakoutLookback)
+trailingStopLowLevel  = ta.lowest(low[1], trailingStopLookback)
+// Fixed literal length (not a dynamic bar_index-based expression) -- Pine's windowing
+// functions size their internal history buffer off the WORST CASE a series-valued length
+// argument could ever reach across the whole chart, not the clamped runtime value, so a
+// growing bar_index (even math.min-capped) still blows the 15000-bar ceiling on long charts.
+// A fixed 15000 (~60 years of daily bars) auto-truncates near the chart's start with no error.
+allTimeHighLevel      = ta.highest(high[1], 15000)
+
+pivotHighRaw = ta.pivothigh(high, swingLookback, swingLookback)
+var float confirmedSwingHigh = na
+if not na(pivotHighRaw)
+    confirmedSwingHigh := pivotHighRaw
+swingHighLevel = confirmedSwingHigh[1]
+
+// ============================================================================
+// STATE
+// ============================================================================
+var string[] unitId          = array.new<string>()
+var float[]  unitEntryPrice  = array.new<float>()
+var float[]  unitEntryN      = array.new<float>()
+var float[]  unitInitialQty  = array.new<float>()
+var float[]  unitQty         = array.new<float>()
+var int[]    unitEntryBar    = array.new<int>()
+var bool[]   unitTp1Done     = array.new<bool>()
+var bool[]   unitTp2Done     = array.new<bool>()
+var bool[]   unitRegimeDone  = array.new<bool>()
+
+var int   unitCounter             = 0
+var float lastAddPrice            = na
+var int   lastAddBar              = na
+var float lastSwingLevelUsed      = na
+var float currentStop             = na
+var float trailingStopLevel       = na
+var float highestHighSinceEntry   = na
+var bool  breakevenTriggered      = false
+var float firstEntryPrice         = na
+var float firstEntryN             = na
+var int   lastLossExitBar         = na
+var bool  inPosition              = false
+var float equityPeak              = strategy.initial_capital
+
+// Position box state -- one green (profit) + one red (risk) box + one dashed entry line per
+// EPISODE (not per pyramid unit), same as _position_zone()/_position_line() in turtle_ui.py:
+// green from entry up to the highest High actually reached (run-up high, not a frozen target),
+// red from entry down to the FIRST unit's own original stop definition (not the ratcheted one).
+var box  greenBox   = na
+var box  redBox      = na
+var line entryLineObj = na
+var float episodeStopLevel = na
+
+equityPeak := math.max(equityPeak, strategy.equity)
+
+// ============================================================================
+// POSITION SIZING  (authentic Turtle sizing: shares = risk_amount / (stop_n_mult * N),
+// same formula/reasoning as size_unit() in turtle_dual_system.py)
+// ============================================================================
+f_riskPctForUnit(unitNumber) =>
+    pct = riskPct
+    if useRiskSchedule
+        pct := unitNumber == 1 ? riskUnit1 : unitNumber == 2 ? riskUnit2 : riskUnit3Plus
+    if useDrawdownScaling and equityPeak > 0
+        currentDd = (equityPeak - strategy.equity) / equityPeak
+        if currentDd > ddScalingThresholdPct / 100.0
+            pct := pct * ddScalingFactor
+    pct
+
+// syminfo.pointvalue: dollar value of a 1-point move for ONE contract of the CURRENT symbol.
+// =1 for stocks/forex/spot (1 point of price = $1/unit, so this is a no-op there). For futures
+// it's the real contract multiplier -- e.g. 50 for ES1! (S&P 500 E-mini: $50 per index point per
+// contract), 20 for NQ1!, 1000 for CL1! (crude, $1000/point), etc. Treating "qty" as if 1 point =
+// $1 (the original bug) silently sized every position at its true notional MULTIPLIED by however
+// big that instrument's point value is -- 50x too large on ES1!, independent of and on top of
+// whatever "Max total exposure" was set to, which is why lowering that alone wouldn't have fixed
+// this: the position was oversized before that cap was ever applied.
+f_currentNotional() =>
+    total = 0.0
+    if array.size(unitQty) > 0
+        for idx = 0 to array.size(unitQty) - 1
+            total += array.get(unitQty, idx) * array.get(unitEntryPrice, idx) * syminfo.pointvalue
+    total
+
+f_computeQty(unitNumber) =>
+    riskPctHere    = f_riskPctForUnit(unitNumber)
+    riskAmount     = strategy.equity * (riskPctHere / 100.0)
+    stopDistance   = stopNMult * n
+    targetQty      = riskAmount / (stopDistance * syminfo.pointvalue)
+    targetNotional = targetQty * close * syminfo.pointvalue
+    maxTotalNotional = (maxTotalExposurePct / 100.0) * strategy.equity
+    roomLeft       = maxTotalNotional - f_currentNotional()
+    finalNotional  = math.min(targetNotional, math.max(roomLeft, 0.0))
+    finalNotional / (close * syminfo.pointvalue)
+
+// ============================================================================
+// ENTRY FILTERS
+// ============================================================================
+emaOk        = not useEmaFilter or close > emaTrend
+choppinessOk = not useChoppinessFilter or (not na(choppinessVal) and choppinessVal <= choppinessMax)
+athOk        = not requireAllTimeHigh or (not na(allTimeHighLevel) and close > allTimeHighLevel)
+cooldownOk   = not useCooldown or na(lastLossExitBar) or (bar_index - lastLossExitBar) >= cooldownDays
+
+buffer          = entryBufferNMult * n
+breakoutSignal  = not na(breakoutLevel) and close > breakoutLevel + buffer
+canEnterNew     = not inPosition and breakoutSignal and emaOk and choppinessOk and athOk and cooldownOk and not na(n) and n > 0
+
+// ============================================================================
+// NEW ENTRY
+// ============================================================================
+if canEnterNew
+    qty0 = f_computeQty(1)
+    if qty0 > 0
+        unitCounter += 1
+        idStr = "S2U" + str.tostring(unitCounter)
+        strategy.entry(idStr, strategy.long, qty=qty0, comment="S2 Entry")
+        array.push(unitId, idStr)
+        array.push(unitEntryPrice, close)
+        array.push(unitEntryN, n)
+        array.push(unitInitialQty, qty0)
+        array.push(unitQty, qty0)
+        array.push(unitEntryBar, bar_index)
+        array.push(unitTp1Done, false)
+        array.push(unitTp2Done, false)
+        array.push(unitRegimeDone, false)
+        inPosition            := true
+        currentStop           := close - stopNMult * n
+        trailingStopLevel     := na
+        highestHighSinceEntry := high
+        breakevenTriggered    := false
+        firstEntryPrice       := close
+        firstEntryN           := n
+        lastAddPrice          := close
+        lastAddBar            := bar_index
+        lastSwingLevelUsed    := na
+        episodeStopLevel      := close - stopNMult * n
+
+        if showPositionBoxes
+            // xloc.bar_time (absolute timestamp), NOT xloc.bar_index: bar_index is only a
+            // RELATIVE count from wherever the currently-loaded chart data happens to start --
+            // when TradingView loads more history as you scroll back, that starting point
+            // shifts, and every bar's index shifts with it, which silently orphans anything
+            // already drawn at a specific index number. Timestamps never shift.
+            greenBox := box.new(time, high, time, close, border_color=color.new(color.green, 30),
+                 bgcolor=color.new(color.green, 82), xloc=xloc.bar_time)
+            redBox   := box.new(time, close, time, episodeStopLevel, border_color=color.new(color.red, 30),
+                 bgcolor=color.new(color.red, 82), xloc=xloc.bar_time)
+            entryLineObj := line.new(time, close, time, close, color=color.gray,
+                 style=line.style_dashed, xloc=xloc.bar_time)
+
+// ============================================================================
+// PYRAMID ADD  (checked only when already in position)
+// ============================================================================
+if inPosition and array.size(unitId) < maxUnitsPerTrend
+    spacingOk = false
+    if pyramidMethod == "breakout"
+        freshHighOk    = not na(pyramidBreakoutLevel) and close > pyramidBreakoutLevel
+        daysSinceAdd   = na(lastAddBar) ? 999999 : bar_index - lastAddBar
+        timeGateOk     = daysSinceAdd >= pyramidBreakoutLookback
+        spacingOk := freshHighOk and timeGateOk
+    else if pyramidMethod == "swing_high"
+        aboveSwing = not na(swingHighLevel) and close > swingHighLevel
+        newLevel   = na(lastSwingLevelUsed) or (not na(swingHighLevel) and swingHighLevel > lastSwingLevelUsed)
+        spacingOk := aboveSwing and newLevel
+    else
+        spacingOk := not na(n) and (close - lastAddPrice) >= pyramidSpacingNMult * n
+
+    pyramidAdxOk = not usePyramidAdxFilter or adxVal <= pyramidMaxAdx
+    pyramidAthOk = not requireAllTimeHigh or (not na(allTimeHighLevel) and close > allTimeHighLevel)
+
+    if spacingOk and pyramidAdxOk and pyramidAthOk and not na(n) and n > 0
+        qtyAdd = f_computeQty(array.size(unitId) + 1)
+        if qtyAdd > 0
+            unitCounter += 1
+            idStr = "S2U" + str.tostring(unitCounter)
+            strategy.entry(idStr, strategy.long, qty=qtyAdd, comment="S2 Add")
+            array.push(unitId, idStr)
+            array.push(unitEntryPrice, close)
+            array.push(unitEntryN, n)
+            array.push(unitInitialQty, qtyAdd)
+            array.push(unitQty, qtyAdd)
+            array.push(unitEntryBar, bar_index)
+            array.push(unitTp1Done, false)
+            array.push(unitTp2Done, false)
+            array.push(unitRegimeDone, false)
+            lastAddPrice := close
+            lastAddBar   := bar_index
+            if pyramidMethod == "swing_high"
+                lastSwingLevelUsed := swingHighLevel
+            if ratchetStopOnPyramid
+                if useAverageEntryStop
+                    totalSh  = 0.0
+                    weighted = 0.0
+                    for idx = 0 to array.size(unitId) - 1
+                        sh = array.get(unitQty, idx)
+                        totalSh  += sh
+                        weighted += sh * array.get(unitEntryPrice, idx)
+                    avgEntry = totalSh > 0 ? weighted / totalSh : close
+                    currentStop := math.max(currentStop, avgEntry - stopNMult * n)
+                else
+                    currentStop := close - stopNMult * n
+            // ratchetStopOnPyramid == false: currentStop is deliberately left untouched --
+            // stays exactly where the FIRST entry set it, same as the Python engine
+
+// ============================================================================
+// STOP-LEVEL BOOKKEEPING  (breakeven ratchet + chandelier/trailing tracking)
+// ============================================================================
+float chandelierLevel = na
+if inPosition
+    // tracked unconditionally (not gated on useChandelierExit) -- the green position box's top
+    // (run-up high) needs this regardless of whether Chandelier itself is enabled as a stop
+    highestHighSinceEntry := na(highestHighSinceEntry) ? high : math.max(highestHighSinceEntry, high)
+    if useChandelierExit and not na(n)
+        chandelierLevel := highestHighSinceEntry - chandelierAtrMult * n
+
+    if useNDayLowTrailingStop and not na(trailingStopLowLevel)
+        trailingStopLevel := na(trailingStopLevel) ? trailingStopLowLevel : math.max(trailingStopLevel, trailingStopLowLevel)
+
+    if useBreakevenStop and not breakevenTriggered and not na(firstEntryPrice) and not na(firstEntryN)
+        riskPerShare = stopNMult * firstEntryN
+        triggerPrice = firstEntryPrice + breakevenTriggerR * riskPerShare
+        if high >= triggerPrice
+            currentStop        := math.max(currentStop, firstEntryPrice)
+            breakevenTriggered := true
+
+    // Extend the position boxes/line to today -- green top tracks the run-up high (matches
+    // turtle_ui.py's build_lightweight_chart_data(), which extends the TP zone to the highest
+    // actual High reached, not a frozen target); red bottom stays fixed at the episode's
+    // ORIGINAL stop definition, same as the Python chart (not the ratcheted current_stop).
+    if showPositionBoxes and not na(greenBox) and not na(redBox) and not na(entryLineObj)
+        box.set_right(greenBox, time)
+        box.set_top(greenBox, math.max(box.get_top(greenBox), highestHighSinceEntry))
+        box.set_right(redBox, time)
+        line.set_x2(entryLineObj, time)
+
+// Effective stop = tightest (highest, for a long) of every ACTIVE stop-type mechanism --
+// see the file header for why this can differ from the Python engine's fixed priority order
+// on days where more than one would have fired.
+float effectiveStop = na
+if inPosition
+    effectiveStop := useFixedStop ? currentStop : na
+    if useNDayLowTrailingStop and not na(trailingStopLevel)
+        effectiveStop := na(effectiveStop) ? trailingStopLevel : math.max(effectiveStop, trailingStopLevel)
+    if useChandelierExit and not na(chandelierLevel)
+        effectiveStop := na(effectiveStop) ? chandelierLevel : math.max(effectiveStop, chandelierLevel)
+
+// ============================================================================
+// PER-UNIT EXITS: stop (native order, real gap handling) + scale-out / regime
+// scale-out / time-stop (manually triggered so partial qty bookkeeping stays
+// correct, then handed to Pine as a limit/market order for the actual fill)
+// ============================================================================
+if inPosition and array.size(unitId) > 0
+    for idx = array.size(unitId) - 1 to 0
+        uId     = array.get(unitId, idx)
+        ePrice  = array.get(unitEntryPrice, idx)
+        eN      = array.get(unitEntryN, idx)
+        initQty = array.get(unitInitialQty, idx)
+        curQty  = array.get(unitQty, idx)
+        eBar    = array.get(unitEntryBar, idx)
+
+        // native stop order -- resubmitting each bar updates the pending stop rather than
+        // stacking duplicates, and TradingView's own emulator fills at the OPEN if the bar
+        // gapped through it (realistic, same behavior as the Python engine's own gap fix)
+        if not na(effectiveStop)
+            strategy.exit("SL_" + uId, from_entry=uId, stop=effectiveStop, comment="SL")
+
+        // fixed R-multiple scale-out
+        if useScaleOut and curQty > 0
+            tpDist = tpN
+            if not array.get(unitTp1Done, idx)
+                lvl1 = ePrice + scaleOutR1 * tpDist
+                if high >= lvl1
+                    qty1 = math.min(initQty * (scaleOutFrac1Pct / 100.0), curQty)
+                    if qty1 > 0
+                        strategy.exit("TP1_" + uId, from_entry=uId, limit=lvl1, qty=qty1, comment="TP1")
+                        array.set(unitTp1Done, idx, true)
+                        array.set(unitQty, idx, curQty - qty1)
+                        curQty := curQty - qty1
+            if curQty > 0 and not array.get(unitTp2Done, idx)
+                lvl2 = ePrice + scaleOutR2 * tpDist
+                if high >= lvl2
+                    qty2 = math.min(initQty * (scaleOutFrac2Pct / 100.0), curQty)
+                    if qty2 > 0
+                        strategy.exit("TP2_" + uId, from_entry=uId, limit=lvl2, qty=qty2, comment="TP2")
+                        array.set(unitTp2Done, idx, true)
+                        array.set(unitQty, idx, curQty - qty2)
+                        curQty := curQty - qty2
+
+        // regime-triggered scale-out: ADX spiking while already profitable
+        if useRegimeScaleOut and curQty > 0 and not array.get(unitRegimeDone, idx) and close > ePrice and adxVal > regimeAdxThresholdIn
+            qtyR = math.min(initQty * (regimeScaleOutFracPct / 100.0), curQty)
+            if qtyR > 0
+                strategy.close(uId, qty=qtyR, comment="RegimeSO")
+                array.set(unitRegimeDone, idx, true)
+                array.set(unitQty, idx, curQty - qtyR)
+                curQty := curQty - qtyR
+
+        // time stop -- close the WHOLE remaining unit if it hasn't proven itself by now
+        if useTimeStop and curQty > 0 and (bar_index - eBar) >= timeStopDays
+            riskPerShare = stopNMult * eN
+            currentR     = riskPerShare > 0 ? (close - ePrice) / riskPerShare : 0.0
+            if currentR < timeStopMinR
+                strategy.close(uId, comment="TimeStop")
+                array.set(unitQty, idx, 0.0)
+
+// ============================================================================
+// CHANNEL EXIT -- close-based signal, fires the whole position at THIS bar's close
+// (process_orders_on_close=true makes this match, no gap ambiguity to model)
+// ============================================================================
+channelExit = inPosition and not na(exitLowLevel) and close < exitLowLevel
+if channelExit
+    strategy.close_all(comment="ChannelExit")
+
+// ============================================================================
+// RESET STATE once fully flat (mirrors finalize_episode()'s cleanup in Python)
+//
+// Deliberately NOT gated on strategy.position_size/strategy.closedtrades: those
+// built-ins reflect fills from orders already resolved as of the START of this
+// bar, not orders this same bar's script pass just submitted -- gating the
+// reset on them risks a 1-bar-late reset (inPosition would stay stuck true,
+// silently blocking a fresh entry signal on the very next bar). Instead this
+// mirrors its OWN stop check (low <= effectiveStop) so the state machine and
+// the native order that's actually resolving the real fill agree on WHICH bar
+// the exit happens on -- the native strategy.exit() order is still what
+// determines the real $ P&L/equity (with full gap realism); this is only
+// self-consistent bookkeeping for the state machine and the cooldown gate.
+// ============================================================================
+stopTriggered = inPosition and not na(effectiveStop) and low <= effectiveStop
+fullExitThisBar = stopTriggered or channelExit
+if fullExitThisBar
+    exitPriceRough = stopTriggered ? effectiveStop : close
+    totalSh2  = 0.0
+    weighted2 = 0.0
+    if array.size(unitId) > 0
+        for idx = 0 to array.size(unitId) - 1
+            sh2 = array.get(unitQty, idx)
+            totalSh2  += sh2
+            weighted2 += sh2 * array.get(unitEntryPrice, idx)
+    avgEntryRough = totalSh2 > 0 ? weighted2 / totalSh2 : exitPriceRough
+    wasLoss = exitPriceRough < avgEntryRough
+    if useCooldown and wasLoss
+        lastLossExitBar := bar_index
+    array.clear(unitId)
+    array.clear(unitEntryPrice)
+    array.clear(unitEntryN)
+    array.clear(unitInitialQty)
+    array.clear(unitQty)
+    array.clear(unitEntryBar)
+    array.clear(unitTp1Done)
+    array.clear(unitTp2Done)
+    array.clear(unitRegimeDone)
+    inPosition            := false
+    currentStop           := na
+    trailingStopLevel     := na
+    highestHighSinceEntry := na
+    breakevenTriggered    := false
+    firstEntryPrice       := na
+    firstEntryN           := na
+    lastAddPrice          := na
+    lastAddBar             := na
+    lastSwingLevelUsed    := na
+
+// ============================================================================
+// PLOTS -- off by default. These are purely visual reference lines; the Strategy
+// Tester's numbers/trade list don't depend on them at all. Each extra plot line
+// (especially combined with dense pyramid-add trade labels) adds real redraw
+// cost while panning/zooming -- turn this on only when you actually want to
+// LOOK at the levels, and expect panning to feel heavier while it's on.
+// ============================================================================
+plot(showLevels and inPosition and useFixedStop ? currentStop : na, title="Fixed Stop", color=color.red, style=plot.style_circles)
+plot(showLevels and inPosition and useNDayLowTrailingStop ? trailingStopLevel : na, title="Trailing Stop", color=color.orange, style=plot.style_circles)
+plot(showLevels and inPosition and useChandelierExit ? chandelierLevel : na, title="Chandelier", color=color.purple, style=plot.style_circles)
+plot(showLevels ? breakoutLevel : na, title="Breakout Level", color=color.blue)
+plot(showLevels ? exitLowLevel : na, title="Exit Channel", color=color.gray)

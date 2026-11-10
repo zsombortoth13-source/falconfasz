@@ -1,0 +1,6 @@
+streamlit
+pandas
+numpy
+yfinance
+altair
+streamlit-lightweight-charts
