@@ -29,6 +29,12 @@ except Exception:                                                  # the chart c
     LWC = False
 
 _boot.empty()
+# Streamlit imports mh_wf_core, the engine and the other modules ONCE per server process, but runs this page file again on every click. When files were replaced while the app was running the
+# page is new and those modules are old (an AttributeError, or worse, a silent mix of old and new rules). Say so plainly and stop: the fix is to start the app again.
+if getattr(core, "LOADED_FINGERPRINT", None) != getattr(core, "code_fingerprint", lambda: None)():
+    st.error("The app's files changed while it was running, so this page and the code it loaded no longer match. Close the app (its console window in the taskbar) and start it again "
+             "(desktop icon). On Streamlit Community Cloud: Manage app > Reboot app.", icon=":material/restart_alt:")
+    st.stop()
 ss = st.session_state
 ON_CLOUD = os.path.abspath(__file__).replace("\\", "/").startswith("/mount/src")      # Streamlit Community Cloud: a small shared machine
 

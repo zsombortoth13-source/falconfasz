@@ -143,6 +143,9 @@ def code_fingerprint() -> str:
     return h.hexdigest()[:8]
 
 
+LOADED_FINGERPRINT = code_fingerprint()        # the code as it was when THIS server process imported it: the page compares it with the files now (see mh_walkforward_ui.py)
+
+
 def setup_check(markets, costs: str, source: str) -> str:
     """One line for the sidebar: the code fingerprint, where the cost profile comes from, and how many TradingView files are here."""
     parts = [f"code {code_fingerprint()}"]
