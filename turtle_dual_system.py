@@ -36,6 +36,10 @@ TICKERS = {
 START_DATE = (pd.Timestamp.now() - pd.DateOffset(years=30)).strftime("%Y-%m-%d")   # last 30 years
 END_DATE = None   # None = up to today
 
+# PRICE_SOURCE: where download_data takes the daily prices from. "yahoo" (yfinance, as always) or "tradingview": the CSV files of tv_prices.py (data_tradingview/, fetched from TradingView's
+# data feed), for the markets that have a file; any other market still comes from Yahoo. Both go through the same repair_ohlc cleaning.
+PRICE_SOURCE = "yahoo"
+
 STARTING_CAPITAL_PER_ASSET = 10000.0
 
 DEFAULT_SYSTEM_PARAMS = {
@@ -461,6 +465,11 @@ TAKE_MIN_ONE_UNIT = False
 USE_MARGIN_CALLS = False
 MARGIN_SPEC = {}
 DEFAULT_MARGIN_RATES = (1.0, 0.5)   # for an asset with no MARGIN_SPEC entry: fully cash funded
+# ASSET_MARGIN_SLICE: an equal slice of equity per asset, used as MARGIN. None = off. "equal" = 1 / (number of assets in the shared account); a number = that % of equity for every asset.
+# The slice is a CAP on top of the normal risk-% unit sizing and pyramiding: an asset's total position value can never exceed slice x equity / its initial margin rate (MARGIN_SPEC, i.e. the
+# broker's real margin of that contract; an asset with no entry is fully cash funded, so its position value is capped at the slice itself). 10 assets and a 5% margin rate = at most 200%
+# of equity in each. Equity is the sizing equity at the moment of the trade. Applies to portfolio runs only (a single-asset run has no other assets to share with).
+ASSET_MARGIN_SLICE = None
 
 
 # REPAIR_BAD_DATA: repair known faults in a downloaded price history before it is used (see repair_ohlc). Set False to use the data exactly as
@@ -516,11 +525,30 @@ def repair_ohlc(df: pd.DataFrame, window: int = 120):
     return d, report
 
 
-def download_data(tickers: dict, start: str, end) -> dict:
-    import yfinance as yf
+def download_data(tickers: dict, start: str, end, source: str = None) -> dict:
+    """Daily OHLC per market, cleaned. `source` None = PRICE_SOURCE."""
+    source = source or PRICE_SOURCE
     data = {}
     for name, tk in tickers.items():
-        df = yf.download(tk, start=start, end=end, progress=False, auto_adjust=True)
+        df = None
+        if source == "tradingview":
+            import tv_prices
+            if name in tv_prices.MARKETS and not tv_prices.has(name):
+                # the file is not here (the data_tradingview folder was not uploaded, or the market is new): fetch it now. NEVER fall back to Yahoo for a market that has a TradingView symbol:
+                # that would quietly swap the data source and the length of the history (Yahoo: the last 30 years only)
+                print(f"{name}: no TradingView file here, downloading it from TradingView ...")
+                try:
+                    tv_prices.update(name)
+                except Exception as e:
+                    raise RuntimeError(f"No TradingView file for {name} and downloading it failed ({type(e).__name__}: {str(e)[:120]}). Put the data_tradingview folder next to the app "
+                                       f"(it has one CSV per market), or choose Yahoo Finance as the price source.") from e
+            if tv_prices.has(name):
+                df = tv_prices.load(name, start, end)
+            else:
+                print(f"{name}: no TradingView symbol for this market, taken from Yahoo")
+        if df is None:
+            import yfinance as yf
+            df = yf.download(tk, start=start, end=end, progress=False, auto_adjust=True)
         if df.empty:
             print(f"WARNING: no data for {name} ({tk})")
             continue
@@ -607,10 +635,17 @@ def fetch_all_time_highs(tickers: dict) -> dict:
     ticker, that ticker is simply omitted -- callers should fall back to the in-window
     cummax behavior for it rather than crash.
     """
-    import yfinance as yf
     result = {}
     for name, tk in tickers.items():
         try:
+            if PRICE_SOURCE == "tradingview":
+                import tv_prices
+                if tv_prices.has(name):
+                    high = tv_prices.load(name)["High"].dropna()
+                    result[name] = high.cummax()
+                    print(f"  {name}: full TradingView history back to {high.index.min().date()} (true all-time high so far: {high.cummax().iloc[-1]:.2f})")
+                    continue
+            import yfinance as yf
             df = yf.download(tk, period="max", progress=False, auto_adjust=True)
             if df.empty:
                 print(f"  WARNING: no full-history data for {name} ({tk}) -- falling back to "
@@ -967,7 +1002,7 @@ def size_unit(equity: float, entry_price: float, n_value: float, stop_n_mult: fl
               risk_pct: float = 1.0, portfolio_risk_room_left: float = None,
               step: float = None, take_min_one: bool = False, margin_room_notional: float = None,
               counters=None, skip_key=None, gross_room_notional: float = None,
-              min_risk_distance: float = None, stress_room_notional: float = None):
+              min_risk_distance: float = None, stress_room_notional: float = None, asset_cap_notional: float = None):
     """
     Authentic Turtle sizing: contracts/shares = account_risk / (stop_n_mult * N in
     price terms). Verified directly against the book's own worked examples --
@@ -1001,6 +1036,8 @@ def size_unit(equity: float, entry_price: float, n_value: float, stop_n_mult: fl
 
     max_total_notional = (MAX_TOTAL_EXPOSURE_PCT / 100.0) * equity
     room_left = max_total_notional - current_notional
+    if asset_cap_notional is not None:
+        room_left = min(room_left, asset_cap_notional - current_notional)       # ASSET_MARGIN_SLICE: this asset's equal slice of equity, as margin
     if room_left <= 0:
         return None
 
@@ -1472,6 +1509,10 @@ def _make_unit_functions(ctx: dict, equity_state: "_EquityState"):
         if USE_MARGIN_CALLS and equity_state.contexts is not None:
             init_rate = MARGIN_SPEC.get(asset, DEFAULT_MARGIN_RATES)[0]
             margin_room = (account_equity - equity_state.margin_required()[0]) / init_rate
+        asset_cap = None
+        if ASSET_MARGIN_SLICE and equity_state.contexts is not None:
+            slice_fraction = (1.0 / max(len(equity_state.contexts), 1)) if ASSET_MARGIN_SLICE == "equal" else float(ASSET_MARGIN_SLICE) / 100.0
+            asset_cap = account_equity * slice_fraction / MARGIN_SPEC.get(asset, DEFAULT_MARGIN_RATES)[0]
         tail = _tail_at(ctx, iloc) if "tail" in ctx else None
         stress_room = None
         if equity_state.contexts is not None:
@@ -1488,7 +1529,7 @@ def _make_unit_functions(ctx: dict, equity_state: "_EquityState"):
                             counters=equity_state, skip_key=(asset, sys_name, iloc),
                             gross_room_notional=gross_room,
                             min_risk_distance=GAP_SIZING_K * tail * fill if GAP_SIZING_K and tail is not None else None,
-                            stress_room_notional=stress_room)
+                            stress_room_notional=stress_room, asset_cap_notional=asset_cap)
         if sized is None:
             return None
         comm = commission_for(asset, sized["shares"], sized["capital_deployed"])

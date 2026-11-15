@@ -22,8 +22,10 @@ import traceback
 import numpy as np
 import pandas as pd
 
+import baseline_defaults as BD
 import brokers
 import ibkr_fees
+import tv_prices
 import optimize_turtle_dual_system as opt
 import turtle_dual_system as td
 import walk_forward_turtle as wf
@@ -40,24 +42,25 @@ _ORIGINAL_DOWNLOAD = td.download_data
 # ---------------------------------------------------------------------------------------------------------------------------------- settings of the strategy
 # (key, label, group, default, candidate values to search, lowest value accepted). Defaults = the numbers in the TradingView script.
 PARAMS = [
-    ("mh_sma_period", "Price must be above this EMA (days)", "Initial entry and pyramiding", 200, "100, 150, 200, 250, 300", 1),
-    ("mh_min_age", "Monthly high at least this many days old", "Initial entry and pyramiding", 20, "10, 15, 20, 30, 40, 60", 1),
-    ("mh_max_age", "Monthly high at most this many days old", "Initial entry and pyramiding", 365, "120, 180, 250, 365, 500", 2),
-    ("entry_buffer_n_mult", "Entry buffer: the close must be this many ATR above the monthly high", "Initial entry and pyramiding", 0.0, "0, 0.25, 0.5, 1, 1.5, 2", 0.0),
-    ("n_atr_period", "SL ATR period (days)", "Stop loss", 185, "14, 20, 40, 60, 100, 185", 2),
-    ("stop_n_mult", "SL ATR multiplier", "Stop loss", 6.0, "1.5, 2, 3, 4, 6, 8", 0.5),
-    ("tp_atr_period", "TP ATR period (days)", "Take profit", 185, "14, 20, 40, 100, 185", 2),
-    ("tp_n_mult", "TP ATR multiplier", "Take profit", 30.0, "3, 6, 10, 20, 30", 0.25),
+    ("mh_sma_period", "Price must be above this EMA (days)", "Initial entry and pyramiding", BD.MH_VALUES["mh_sma_period"], BD.MH_CANDIDATES["mh_sma_period"], 1),
+    ("mh_min_age", "Monthly high at least this many days old", "Initial entry and pyramiding", BD.MH_VALUES["mh_min_age"], BD.MH_CANDIDATES["mh_min_age"], 1),
+    ("mh_max_age", "Monthly high at most this many days old", "Initial entry and pyramiding", BD.MH_VALUES["mh_max_age"], BD.MH_CANDIDATES["mh_max_age"], 2),
+    ("entry_buffer_n_mult", "Entry buffer: the close must be this many ATR above the monthly high", "Initial entry and pyramiding", BD.MH_VALUES["entry_buffer_n_mult"], BD.MH_CANDIDATES["entry_buffer_n_mult"], 0.0),
+    ("n_atr_period", "SL ATR period (days)", "Stop loss", BD.MH_VALUES["n_atr_period"], BD.MH_CANDIDATES["n_atr_period"], 2),
+    ("stop_n_mult", "SL ATR multiplier", "Stop loss", BD.MH_VALUES["stop_n_mult"], BD.MH_CANDIDATES["stop_n_mult"], 0.5),
+    ("tp_atr_period", "TP ATR period (days)", "Take profit", BD.MH_VALUES["tp_atr_period"], BD.MH_CANDIDATES["tp_atr_period"], 2),
+    ("tp_n_mult", "TP ATR multiplier", "Take profit", BD.MH_VALUES["tp_n_mult"], BD.MH_CANDIDATES["tp_n_mult"], 0.25),
 ]
 PARAM_NAMES = {"mh_sma_period": "EMA", "mh_min_age": "min age", "mh_max_age": "max age", "entry_buffer_n_mult": "buffer", "n_atr_period": "SL ATR",
                "stop_n_mult": "SL x", "tp_atr_period": "TP ATR", "tp_n_mult": "TP x"}
 DEFAULTS = {key: default for key, _, _, default, _, _ in PARAMS}
-RISK_DEFAULT = 1.0
+RISK_DEFAULT = BD.RISK_PER_UNIT_PCT
 UNIT_CAP = 999                                          # no cap of its own: the exposure and open-risk limits still apply
 
 COST_NONE = "No costs"
 COST_FLAT = "Flat % costs (the engine's own, fractional sizes)"
-COST_IBKR = "Interactive Brokers futures (per-contract fees, micro contracts)"
+COST_IBKR = "Interactive Brokers futures (per-contract fees, whole contracts)"
+CONTRACT_SIZES = {brokers.SIZING_MICRO: "Micro (e.g. MNQ, $2 a point)", brokers.SIZING_NANO: "Nano (a tenth of a micro, modelled)", brokers.SIZING_MINI: "Standard (e.g. NQ, $20 a point)"}
 
 
 def parse_candidates(text: str, default) -> list:
@@ -115,10 +118,50 @@ def cache_age_hours(markets) -> float:
     return max(ages) if ages else float("inf")
 
 
-def load_prices(markets, refresh: bool = False) -> dict:
-    """Daily prices of the markets: from the disk cache when saved within CACHE_HOURS hours, else downloaded (Yahoo, the engine's own cleaning) and saved."""
+SOURCE_YAHOO = "yahoo"
+SOURCE_TV = "tradingview"
+SOURCES = {SOURCE_YAHOO: "Yahoo Finance (as before)", SOURCE_TV: "TradingView files (longer history)"}
+
+
+def default_history_start() -> str:
+    """The baseline's start (1951-01-01) for the TradingView files, which go back that far; Yahoo's own history is the last 30 years."""
+    return BD.HISTORY_START
+
+
+def data_summary(prices: dict, source: str) -> dict:
+    """Where a run's prices came from and how far they reach: {'source', 'first', 'last'} (the earliest first bar and the latest last bar of the markets), {} when there are none."""
+    firsts = [df.index[0] for df in prices.values() if len(df)]
+    lasts = [df.index[-1] for df in prices.values() if len(df)]
+    return {"source": source, "first": min(firsts), "last": max(lasts)} if firsts else {}
+
+
+def data_caption(info: dict) -> str:
+    """'prices: TradingView files, 1951-01-02 to 2026-11-13' for a result's caption ('' without information)."""
+    if not info:
+        return ""
+    return f"prices: {'TradingView files' if info['source'] == SOURCE_TV else 'Yahoo Finance'}, {info['first'].date()} to {info['last'].date()}"
+
+
+def load_prices(markets, refresh: bool = False, source: str = SOURCE_YAHOO, history_start: str = None) -> dict:
+    """Daily prices of the markets. Yahoo: from the disk cache when saved within CACHE_HOURS hours, else downloaded (the engine's own cleaning) and saved. TradingView: read from the files of
+    tv_prices.py (the engine's own cleaning too), from `history_start` (default the baseline's 1951-01-01). A market whose file is missing is downloaded from TradingView first, and if that fails the
+    run stops with a clear error: a market with a TradingView symbol is never quietly taken from Yahoo (whose history is only the last 30 years)."""
+    if source == SOURCE_TV:
+        have = [m for m in markets if m in tv_prices.MARKETS]
+        data = {}
+        if have:
+            data = _ORIGINAL_DOWNLOAD({m: ALL_TICKERS[m] for m in have}, history_start or td.START_DATE, td.END_DATE, SOURCE_TV)
+        for name, df in data.items():
+            df.attrs["asset"] = name
+        rest = [m for m in markets if m not in tv_prices.MARKETS]          # no TradingView symbol at all: only these may come from Yahoo
+        if rest:
+            print(f"No TradingView symbol for {', '.join(rest)}: Yahoo is used for them.")
+            data.update(load_prices(rest, refresh))
+        info = data_summary(data, source)
+        print(f"Prices: {len([m for m in markets if m in data and m in have])} market(s) from the TradingView files" + (f", {info['first'].date()} to {info['last'].date()}" if info else ""))
+        return data
     os.makedirs(CACHE_DIR, exist_ok=True)
-    data, fetched = {}, []
+    data, fetched, stale = {}, [], []
     for m in markets:
         path = _cache_path(m, ALL_TICKERS[m])
         fresh = os.path.exists(path) and (time.time() - os.path.getmtime(path)) < CACHE_HOURS * 3600 and not refresh
@@ -129,15 +172,27 @@ def load_prices(markets, refresh: bool = False) -> dict:
                 continue
             except Exception:
                 pass
-        got = _ORIGINAL_DOWNLOAD({m: ALL_TICKERS[m]}, td.START_DATE, td.END_DATE)
+        try:
+            got = _ORIGINAL_DOWNLOAD({m: ALL_TICKERS[m]}, td.START_DATE, td.END_DATE)
+        except Exception as e:                                  # e.g. Yahoo refusing a shared server: fall back to what is saved
+            print(f"Download of {m} failed ({type(e).__name__}: {str(e)[:80]})")
+            got = {}
         if m in got:
             data[m] = got[m]
             fetched.append(m)
             with open(path, "wb") as f:
                 pickle.dump(got[m], f)
+        elif os.path.exists(path):                              # the download gave nothing: use the saved copy however old it is
+            try:
+                with open(path, "rb") as f:
+                    data[m] = pickle.load(f)
+                stale.append(m)
+            except Exception:
+                pass
     for name, df in data.items():
         df.attrs["asset"] = name
-    print(f"Prices: {len(data) - len(fetched)} market(s) from the disk cache, {len(fetched)} downloaded" + (f" ({', '.join(fetched)})" if fetched else ""))
+    print(f"Prices: {len(data) - len(fetched) - len(stale)} market(s) from the disk cache, {len(fetched)} downloaded" + (f" ({', '.join(fetched)})" if fetched else "")
+          + (f"; {len(stale)} saved copy(ies) used because the download failed ({', '.join(stale)})" if stale else ""))
     return data
 
 
@@ -173,6 +228,7 @@ def configure_account(s: dict, markets) -> list:
     td.MARK_TO_MARKET = True
     td.EXECUTION_TIMING = "next_open"
     td.ASSET_RISK_MULT, td.ASSET_RISK_NORMALIZE, td.STOP_SLIPPAGE_PCT = {}, False, 0.0
+    td.ASSET_MARGIN_SLICE = "equal" if s.get("margin_slice") else None            # an equal slice of equity per market, used as margin (a cap on the normal sizing)
     td.CARRY_MODE, td.CARRY_RATE_SERIES, td.CARRY_RATE_FLAT, td.CARRY_DIVIDEND_YIELD = "off", None, 0.0, {}
     td.PORTFOLIO_STARTING_CAPITAL = float(s["capital"])
     td.USE_PORTFOLIO_RISK_CAP, td.MAX_PORTFOLIO_RISK_PCT = True, float(s["max_risk_pct"])
@@ -181,6 +237,7 @@ def configure_account(s: dict, markets) -> list:
         td.SLIPPAGE_PCT = td.SPREAD_PCT = td.COMMISSION_PCT = td.HOLDING_COST_PCT_PER_YEAR = 0.0
     elif s["costs"] == COST_IBKR:
         profile, sizing = broker_profile()
+        sizing = s.get("contract_size") or sizing
         if profile is None:
             notes.append("No futures broker profile found in the brokers folder: flat % costs were used instead.")
         else:
@@ -188,6 +245,7 @@ def configure_account(s: dict, markets) -> list:
             for name, value in compiled["engine"].items():
                 setattr(td, name, value)
             notes += list(compiled["notes"])
+            td.TAKE_MIN_ONE_UNIT = bool(s.get("take_min_one"))          # whole contracts: when the risk-based size rounds down to zero, open one contract anyway (if it fits the notional cap)
     td.TICKERS = {m: ALL_TICKERS[m] for m in markets}
     td.MH_CLEAN_MODE = True
     opt.ENABLE_S1, opt.ENABLE_S2 = True, False
@@ -215,8 +273,22 @@ def configure_engine(s: dict, markets) -> list:
     return notes
 
 
+def configure_optimizer(s: dict, markets) -> tuple:
+    """Sets the engine for an OPTIMIZER run: the same account as a backtest, every trial trading from s['start'] (the indicators use all the history before it), ranked by one metric.
+    Returns (notes, only_optimize, fixed_values)."""
+    notes = configure_account(s, markets)
+    opt.SCORE_MODE = "portfolio"
+    opt.RANK_METRIC = s["rank_metric"]
+    opt.RANDOM_SEED = int(s.get("seed", 42))
+    opt.FEATURE_START = pd.Timestamp(s["start"])
+    space, only, fixed, _ = build_search(s["values"], s["searched"], s["candidates"], s["exposure_pct"])
+    opt.set_search_space(space)
+    return notes, only, fixed
+
+
 def restore_engine():
     td.MH_CLEAN_MODE = False
+    opt.FEATURE_START = None
     td.TICKERS = dict(ALL_TICKERS)
     td.download_data = _ORIGINAL_DOWNLOAD
     opt.set_search_space(opt.DEFAULT_SEARCH_SPACE)
@@ -225,7 +297,7 @@ def restore_engine():
 
 # ---------------------------------------------------------------------------------------------------------------------------------- one background run at a time
 LOCK = threading.Lock()
-RUN = {"thread": None, "buf": io.StringIO(), "cancel": threading.Event(), "result": None, "error": None, "settings": None, "t0": None, "t1": None, "notes": []}
+RUN = {"thread": None, "buf": io.StringIO(), "cancel": threading.Event(), "result": None, "error": None, "settings": None, "t0": None, "t1": None, "notes": [], "opt": {}}
 
 
 def is_running() -> bool:
@@ -233,12 +305,17 @@ def is_running() -> bool:
     return bool(t is not None and t.is_alive())
 
 
+def run_kind() -> str:
+    """'optimize' or 'walkforward': what the last started run (finished or not) was."""
+    return (RUN["settings"] or {}).get("kind", "walkforward")
+
+
 def start_run(settings: dict) -> str:
-    """Starts a walk-forward in a background thread. Returns '' when started, else the reason it did not."""
+    """Starts a walk-forward (or, with settings['kind'] == 'optimize', an optimizer search) in a background thread. Returns '' when started, else the reason it did not."""
     if not LOCK.acquire(blocking=False):
         return "A run is still in progress."
-    RUN.update(buf=io.StringIO(), cancel=threading.Event(), result=None, error=None, settings=settings, t0=time.time(), t1=None, notes=[])
-    thread = threading.Thread(target=_run, args=(settings,), daemon=True)
+    RUN.update(buf=io.StringIO(), cancel=threading.Event(), result=None, error=None, settings=settings, t0=time.time(), t1=None, notes=[], opt={})
+    thread = threading.Thread(target=_run_optimize if settings.get("kind") == "optimize" else _run, args=(settings,), daemon=True)
     RUN["thread"] = thread
     thread.start()
     return ""
@@ -252,12 +329,46 @@ def _run(settings: dict):
     try:
         with contextlib.redirect_stdout(RUN["buf"]):
             markets = list(settings["markets"])
-            prices = load_prices(markets, refresh=bool(settings.get("refresh")))
+            prices = load_prices(markets, refresh=bool(settings.get("refresh")), source=settings.get("price_source", SOURCE_YAHOO), history_start=settings.get("history_start"))
             markets = [m for m in markets if m in prices]
             RUN["notes"] = configure_engine(settings, markets)
             td.download_data = lambda tickers, start, end: {k: v for k, v in prices.items() if k in tickers}     # the walk-forward asks for prices itself: hand it the cached ones
             result = wf.main(cancel_event=RUN["cancel"])
         RUN["result"] = summarize(result, settings, prices, RUN["buf"].getvalue())
+        RUN["result"]["data_info"] = data_summary(prices, settings.get("price_source", SOURCE_YAHOO))
+    except Exception:
+        RUN["error"] = traceback.format_exc()
+    finally:
+        restore_engine()
+        RUN["t1"] = time.time()
+        LOCK.release()
+
+
+def _run_optimize(settings: dict):
+    """The optimizer: an Optuna search over the ticked settings on ONE stretch of history (from settings['start'] to the last bar), every trial a full backtest of the shared account."""
+    try:
+        with contextlib.redirect_stdout(RUN["buf"]):
+            markets = list(settings["markets"])
+            prices = load_prices(markets, refresh=bool(settings.get("refresh")), source=settings.get("price_source", SOURCE_YAHOO), history_start=settings.get("history_start"))
+            markets = [m for m in markets if m in prices]
+            raw = {m: prices[m] for m in markets}
+            RUN["notes"], only, fixed = configure_optimizer(settings, markets)
+            ath = {m: df["High"].cummax() for m, df in raw.items()}        # as the walk-forward does (the clean strategy does not use it)
+            n_workers = int(settings["workers"]) if settings.get("workers") else max(1, (os.cpu_count() or 2) - 1)
+            n_workers = max(1, min(n_workers, int(settings["trials"])))
+            print(f"Optimizer: {settings['trials']} trials, ranked by {settings['rank_metric']}, {n_workers} worker process(es), {len(markets)} markets from {settings['start']}")
+            t0 = time.time()
+
+            def on_round(done, total, n_valid, n_bad):
+                RUN["opt"] = {"done": done, "total": total, "valid": n_valid, "failed": n_bad}
+                print(f"  ...{done}/{total} trials done ({time.time() - t0:.0f}s elapsed, {n_valid} valid, {n_bad} skipped)")
+
+            results, n_failed = opt.search_optuna(raw, ath, int(settings["trials"]), n_workers, only_optimize=only, fixed_values=fixed, seed=int(settings.get("seed", 42)),
+                                                  progress_cb=on_round, cancel_check=RUN["cancel"].is_set)
+            if RUN["cancel"].is_set():
+                print("Stopped: the trials finished so far are kept.")
+        RUN["result"] = summarize_optimize(results, n_failed, settings, RUN["buf"].getvalue())
+        RUN["result"]["data_info"] = data_summary(raw, settings.get("price_source", SOURCE_YAHOO))
     except Exception:
         RUN["error"] = traceback.format_exc()
     finally:
@@ -267,9 +378,14 @@ def _run(settings: dict):
 
 
 def progress() -> dict:
-    """{'phase', 'done', 'total', 'elapsed', 'eta'} read from the walk-forward's own printed lines."""
+    """{'phase', 'done', 'total', 'elapsed', 'eta'} read from the walk-forward's own printed lines (or, for the optimizer, from its rounds)."""
     text = RUN["buf"].getvalue()
     elapsed = (RUN["t1"] or time.time()) - (RUN["t0"] or time.time())
+    if run_kind() == "optimize":
+        o = RUN["opt"] or {}
+        done, total = int(o.get("done", 0)), int(o.get("total", 0))
+        phase = "Loading prices and starting the search" if not total else (f"Searching ({done}/{total} trials done, {o.get('valid', 0)} valid)" if done < total else "Summarizing")
+        return {"phase": phase, "done": done, "total": total, "elapsed": elapsed, "eta": (elapsed / done * (total - done)) if done and total > done else None}
     m = re.findall(r"\((\d+)/(\d+) windows finished, (\d+)s elapsed\)", text)
     total_m = re.search(r"Running (\d+) window", text)
     total = int(total_m.group(1)) if total_m else 0
@@ -307,7 +423,7 @@ def summarize(result: dict, s: dict, prices: dict, log: str) -> dict:
     rows = []
     for i, r in enumerate(result.get("window_reports", []), start=1):
         row = {"window": i, "status": r["status"], "train": f"{r['train_start'].date()} to {r['train_end'].date()}", "test": f"{r['test_start'].date()} to {r['test_end'].date()}",
-               "IS Sharpe": r.get("is_sharpe"), "OOS Sharpe": r.get("oos_sharpe"), "OOS CAGR %": None if r.get("oos_cagr") is None else r["oos_cagr"] * 100,
+               "IS Sharpe": r.get("is_sharpe"), "OOS Sharpe": r.get("oos_sharpe"), "IS Sortino": r.get("is_sortino"), "OOS Sortino": r.get("oos_sortino"), "OOS CAGR %": None if r.get("oos_cagr") is None else r["oos_cagr"] * 100,
                "OOS max DD %": None if r.get("oos_max_dd") is None else r["oos_max_dd"] * 100, "OOS trades": r.get("oos_trades")}
         for key, short in PARAM_NAMES.items():
             if r.get("params") and key in r["params"]:
@@ -338,6 +454,109 @@ def summarize(result: dict, s: dict, prices: dict, log: str) -> dict:
                     top = col.value_counts().iloc[0]
                     picks.append({"setting": short, "most chosen": col.value_counts().index[0], "in windows": f"{int(top)}/{len(col)}", "lowest": col.min(), "median": col.median(), "highest": col.max()})
         out["picks"] = pd.DataFrame(picks)
+    return out
+
+
+def summarize_optimize(results: list, n_failed: int, s: dict, log: str, keep: int = 100) -> dict:
+    """The optimizer's trials ranked by the metric it was asked to rank by: the best `keep` as a table (one row per trial) and as the full result dicts."""
+    metric = s["rank_metric"]
+    ranked = sorted((r for r in results if np.isfinite(r.get(metric, np.nan))), key=lambda r: r[metric], reverse=True)[:keep]
+    rows = []
+    for rank, r in enumerate(ranked, start=1):
+        row = {"rank": rank, "Sharpe": r["sharpe"], "Sortino": r["sortino"], "Calmar": r["calmar"], "CAGR %": r["cagr"] * 100, "Max DD %": r["max_dd"] * 100, "trades": r["total_trades"]}
+        for key, short in PARAM_NAMES.items():
+            if key in r["params"]:
+                row[short] = r["params"][key]
+        rows.append(row)
+    return {"kind": "optimize", "settings": s, "ranked": ranked, "table": pd.DataFrame(rows), "n_valid": len(results), "n_failed": int(n_failed), "log": log}
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------- returns by period
+def _period_keys(index: pd.DatetimeIndex, period: str) -> list:
+    if period == "year":
+        return [index.year]
+    if period == "quarter":
+        return [index.year, (index.month - 1) // 3 + 1]
+    if period == "month":
+        return [index.year, index.month]
+    raise ValueError(f"period must be 'year', 'quarter' or 'month', not {period!r}")
+
+
+def period_returns(curve: pd.Series, period: str = "year") -> pd.Series:
+    """The account's compounded return in each calendar year / quarter / month, from its equity curve (the last value of each period against the last value of the one before; the first period
+    against the curve's first value). The index is the year, or (year, quarter), or (year, month). The first and last periods may be incomplete."""
+    curve = curve.dropna()
+    if len(curve) < 2:
+        return pd.Series(dtype=float)
+    ends = curve.groupby(_period_keys(curve.index, period)).last()
+    before = ends.shift(1)
+    before.iloc[0] = curve.iloc[0]
+    return ends / before - 1.0
+
+
+def yearly_table(curve: pd.Series, bh: pd.Series = None) -> pd.DataFrame:
+    """One row per calendar year: the strategy's return, the equal-weight buy & hold return (when given), the worst drawdown inside the year (from the previous year-end value or the year's own peak,
+    whichever is higher), the equity at the year's end and whether the year is incomplete (the curve starts after 10 January or ends before 20 December)."""
+    curve = curve.dropna()
+    if len(curve) < 2:
+        return pd.DataFrame(columns=["year", "return", "bh_return", "max_dd", "end_equity", "partial"])
+    returns = period_returns(curve, "year")
+    bh_returns = period_returns(bh, "year") if bh is not None and len(bh.dropna()) > 1 else None
+    rows, previous_end = [], float(curve.iloc[0])
+    for year, seg in curve.groupby(curve.index.year):
+        path = np.concatenate([[previous_end], seg.to_numpy(float)])
+        dd = float((path / np.maximum.accumulate(path) - 1.0).min())
+        first, last = seg.index[0], seg.index[-1]
+        partial = bool((year == curve.index[0].year and first > pd.Timestamp(year, 1, 10)) or (year == curve.index[-1].year and last < pd.Timestamp(year, 12, 20)))
+        rows.append({"year": int(year), "return": float(returns.loc[year]), "bh_return": None if bh_returns is None or year not in bh_returns.index else float(bh_returns.loc[year]),
+                     "max_dd": dd, "end_equity": float(seg.iloc[-1]), "partial": partial, "to": last})
+        previous_end = float(seg.iloc[-1])
+    return pd.DataFrame(rows)
+
+
+def period_matrix(curve: pd.Series, period: str = "month") -> pd.DataFrame:
+    """Returns as a table: one row per year, one column per month (period='month': Jan..Dec) or quarter (Q1..Q4), plus a 'Year' column with the calendar-year return. Missing periods are NaN."""
+    r = period_returns(curve, period)
+    if not len(r):
+        return pd.DataFrame()
+    n = 12 if period == "month" else 4
+    names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] if period == "month" else ["Q1", "Q2", "Q3", "Q4"]
+    table = r.unstack(level=1).reindex(columns=range(1, n + 1))
+    table.columns = names
+    table["Year"] = period_returns(curve, "year")
+    table.index.name = "year"
+    return table
+
+
+def return_summary(curve: pd.Series, period: str) -> dict:
+    """Best, worst and median period, and the share of positive periods, for the equity curve (incomplete first / last periods included)."""
+    r = period_returns(curve, period)
+    if not len(r):
+        return {}
+    return {"n": int(len(r)), "positive": int((r > 0).sum()), "best": float(r.max()), "best_at": r.idxmax(), "worst": float(r.min()), "worst_at": r.idxmin(), "median": float(r.median()), "mean": float(r.mean())}
+
+
+def pnl_by_market_year(trades: dict) -> pd.DataFrame:
+    """Realized profit and loss ($, after costs) of the trades by market and by the year each trade closed. trades = {market: [trade dicts with 'pnl' and 'exit_date']}. Totals in a last row and column."""
+    rows = []
+    for market, ts in trades.items():
+        for t in ts or []:
+            if t.get("exit_date") is not None:
+                rows.append({"market": market, "year": pd.Timestamp(t["exit_date"]).year, "pnl": float(t["pnl"])})
+    if not rows:
+        return pd.DataFrame()
+    table = pd.DataFrame(rows).pivot_table(index="market", columns="year", values="pnl", aggfunc="sum").fillna(0.0)
+    table.columns = [str(c) for c in table.columns]                      # the year columns are text, like the 'Total' column next to them
+    table["Total"] = table.sum(axis=1)
+    table = table.sort_values("Total", ascending=False)
+    table.loc["All markets"] = table.sum(axis=0)
+    return table
+
+
+def trial_settings(params: dict, risk: float) -> dict:
+    """One trial's numbers as the strategy panel takes them: whole numbers where the setting is a whole number, plus the risk %."""
+    out = {key: (int(round(float(params[key]))) if isinstance(DEFAULTS.get(key), int) else float(params[key])) for key, *_ in PARAMS if key in params}
+    out["risk_per_trade_pct"] = float(risk)
     return out
 
 
@@ -424,10 +643,10 @@ def run_backtest(s: dict) -> dict:
     """A plain backtest of the strategy with the given numbers on the shared account, from s['start'] (indicators use all earlier history). Returns {'error': ...} or the result dict.
     Refuses while a walk-forward is running (both set the same engine globals)."""
     if not LOCK.acquire(blocking=False):
-        return {"error": "A walk-forward is running: wait for it to finish (or stop it) before a backtest."}
+        return {"error": "A walk-forward or optimizer run is in progress: wait for it to finish (or stop it) before a backtest."}
     try:
         with contextlib.redirect_stdout(io.StringIO()):
-            prices = load_prices(list(s["markets"]), refresh=bool(s.get("refresh")))
+            prices = load_prices(list(s["markets"]), refresh=bool(s.get("refresh")), source=s.get("price_source", SOURCE_YAHOO), history_start=s.get("history_start"))
             markets = [m for m in s["markets"] if m in prices]
             if not markets:
                 return {"error": "No prices could be loaded for the chosen markets."}
@@ -447,7 +666,7 @@ def run_backtest(s: dict) -> dict:
                 td.RECORD_HISTORY = False
         capital = float(s["capital"])
         eq = port["equity_curve"].dropna()
-        out = {"settings": s, "notes": notes, "port": port, "curve": eq, "stats": td.performance_stats(eq, capital),
+        out = {"settings": s, "notes": notes, "data_info": data_summary({m: prices[m] for m in markets}, s.get("price_source", SOURCE_YAHOO)), "port": port, "curve": eq, "stats": td.performance_stats(eq, capital),
                "trades": {m: port["trades_by_asset"].get(m, []) for m in markets}}
         try:
             bh = _equal_weight_buy_and_hold({m: prices[m] for m in markets}, capital, eq.index)

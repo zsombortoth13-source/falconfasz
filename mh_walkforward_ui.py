@@ -1,15 +1,23 @@
-"""Lean Streamlit app for the monthly-high strategy (the Strategy Lab's "Monthly high" mode / turtle_monthly_high.pine): a BACKTEST and a WALK-FORWARD, each with an equity chart, the positions on
-the price charts and Monte Carlo. The strategy's numbers are shared between the two and can be copied, pasted, or sent from a walk-forward window into the backtest.
+"""Lean Streamlit app for the monthly-high strategy (the Strategy Lab's "Monthly high" mode / turtle_monthly_high.pine): a BACKTEST, an OPTIMIZER and a WALK-FORWARD. The backtest and the walk-forward have an
+equity chart, the positions on the price charts and Monte Carlo. The strategy's numbers are shared between the three and can be copied, pasted, or sent from the optimizer or a walk-forward window into the backtest.
 Run:  .venv\\Scripts\\python.exe -m streamlit run mh_walkforward_ui.py   (or double-click run_mh_walkforward.bat)
 Fast because: the heavy work lives in mh_wf_core.py / mh_wf_charts.py (imported once per server process, not on every click), prices come from a disk cache instead of Yahoo, the walk-forward runs
 in a background thread while the page stays usable, and only the view you are looking at is drawn."""
 import datetime as dt
+import os
+
+import streamlit as st
+
+# the page title and a visible message come first: on a cold server the heavy imports below (pandas, scipy, optuna, the engine) can take a minute, and a blank page looks like a hang
+st.set_page_config(page_title="Monthly-high lab", page_icon=":material/timeline:", layout="wide")
+_boot = st.empty()
+_boot.info("Loading the engine - the first start on a cold server takes up to a minute.", icon=":material/hourglass_top:")
 
 import altair as alt
 import numpy as np
 import pandas as pd
-import streamlit as st
 
+import baseline_defaults as BD
 import mh_wf_charts as charts
 import mh_wf_core as core
 import monte_carlo
@@ -20,8 +28,9 @@ try:
 except Exception:                                                  # the chart component is optional
     LWC = False
 
-st.set_page_config(page_title="Monthly-high lab", page_icon=":material/timeline:", layout="wide")
+_boot.empty()
 ss = st.session_state
+ON_CLOUD = os.path.abspath(__file__).replace("\\", "/").startswith("/mount/src")      # Streamlit Community Cloud: a small shared machine
 
 # ------------------------------------------------------------------------------------------------------------------------------------ settings sent from elsewhere (before the widgets exist)
 pending = ss.pop("pending_values", None)
@@ -35,7 +44,7 @@ if ss.pop("pending_clear_paste", False):
 
 st.title("Monthly-high lab")
 st.caption("Entry: close above its EMA and the first close above a monthly high (plus a buffer) that is min..max days old. Adds: every further such signal. Stop: ATR x multiplier under the newest unit, moved up by "
-           "every add. Take profit: each unit at its entry + multiplier x ATR. Nothing else. Backtest it, or walk-forward it: re-optimize on a rolling window of the past and trade the winner on the next, unseen stretch.")
+           "every add. Take profit: each unit at its entry + multiplier x ATR. Nothing else. Backtest it, optimize it, or walk-forward it: re-optimize on a rolling window of the past and trade the winner on the next, unseen stretch.")
 
 
 def fmt_pct(v, digits=1):
@@ -54,27 +63,67 @@ def is_dark() -> bool:
 
 
 @st.cache_data(show_spinner=False)
-def prices_for(asset: str) -> pd.DataFrame:
-    return core.load_prices([asset])[asset]
+def prices_for(asset: str, source: str = "yahoo", history_start: str = None, files_stamp: str = "") -> pd.DataFrame:
+    return core.load_prices([asset], source=source, history_start=history_start)[asset]
 
 
 # ------------------------------------------------------------------------------------------------------------------------------------ sidebar
 with st.sidebar:
     st.subheader("Markets")
     all_markets = list(core.ALL_TICKERS)
-    markets = st.multiselect("Markets", all_markets, default=all_markets, key="w_markets", label_visibility="collapsed")
+    markets = st.multiselect("Markets", all_markets, default=[m for m in BD.MARKETS if m in all_markets], key="w_markets", label_visibility="collapsed")      # the baseline's nine
+    markets = BD.ordered(markets, all_markets)          # one fixed order, whatever order they were clicked in (it decides which market a binding cap serves first)
     st.subheader("Account")
-    capital = st.number_input("Account size ($)", 1_000.0, 1_000_000_000.0, 100_000.0, 10_000.0, key="w_capital")
+    capital = st.number_input("Account size ($)", 1_000.0, 1_000_000_000.0, float(BD.ACCOUNT), 10_000.0, key="w_capital")
     costs = st.selectbox("Trading costs", [core.COST_IBKR, core.COST_FLAT, core.COST_NONE], key="w_costs",
                          help="Interactive Brokers: per-contract fees and whole micro contracts where IBKR has them (standard contracts otherwise; a contract that is too big for the account is skipped). "
                               "Flat %: the engine's own slippage, spread and commission with fractional sizes. The same choices as the Strategy Lab's Fees tab.")
-    margin_calls = st.checkbox("Model margin calls", value=False, key="w_margin", disabled=costs != core.COST_IBKR)
-    exposure = st.number_input("Max notional per market (% of equity)", 50, 2000, 300, 50, key="w_exp", help="New units are skipped above this.")
-    max_risk = st.number_input("Max open risk of the whole account (%)", 1.0, 100.0, 20.0, 1.0, key="w_risk", help="New units are skipped above this (the sum of every open unit's risk at its stop).")
+    contract_size = st.selectbox("Contract size", list(core.CONTRACT_SIZES), format_func=core.CONTRACT_SIZES.get, key="w_contract", disabled=costs != core.COST_IBKR, index=list(core.CONTRACT_SIZES).index(BD.CONTRACT_SIZE),
+                                 help="Interactive Brokers only. Positions are whole contracts of this size, sized down from the risk %: a smaller contract lets a small account take trades a bigger one "
+                                      "cannot. Nano is not a listed product for most of these markets: it is MODELLED as a tenth of a micro with the same margin % and the same fee per contract "
+                                      "(Standard markets without a micro, such as Platinum, use a tenth of the standard).")
+    margin_calls = st.checkbox("Model margin calls", value=BD.MARGIN_CALLS, key="w_margin", disabled=costs != core.COST_IBKR)
+    margin_slice = st.checkbox("Equal margin slice per market", value=BD.MARGIN_SLICE, key="w_slice",
+                               help="Each market may use at most an equal slice of equity (equity divided by the number of markets selected) as MARGIN: its position value times its broker margin rate "
+                                    "(Interactive Brokers numbers; with flat % costs a market counts as fully paid for) can never go above the slice. It is a cap on top of the risk sizing and the adds: "
+                                    "a market keeps adding units until its slice is full. With 15 markets and a 5% margin rate one market can hold at most 133% of equity.")
+    take_min = st.checkbox("Always open at least one contract", value=BD.TAKE_MIN_ONE, key="w_takemin", disabled=costs != core.COST_IBKR,
+                           help="Whole contracts: when the risk-based size rounds down to zero contracts the trade is normally skipped. With this on, one contract is opened anyway (if it fits under the "
+                                "notional cap), which can risk several times the risk % above. Same rule as the TradingView script's 'Always open at least the smallest size'.")
+    exposure = st.number_input("Max notional per market (% of equity)", 50, 2000, int(BD.EXPOSURE_PCT), 50, key="w_exp", help="New units are skipped above this.")
+    max_risk = st.number_input("Max open risk of the whole account (%)", 1.0, 100.0, float(BD.MAX_OPEN_RISK_PCT), 1.0, key="w_risk", help="New units are skipped above this (the sum of every open unit's risk at its stop).")
     st.subheader("Prices")
-    age = core.cache_age_hours(markets) if markets else float("inf")
-    st.caption("Saved on disk: " + ("not yet for every market (the first run downloads them)" if not np.isfinite(age) else f"oldest {age:.1f} h old (refreshed after {core.CACHE_HOURS} h)"))
-    refresh = st.checkbox("Download fresh prices on the next run", value=False, key="w_refresh")
+    price_source = st.selectbox("Price source", list(core.SOURCES), format_func=core.SOURCES.get, key="w_source", index=list(core.SOURCES).index(BD.PRICE_SOURCE),
+                                help="Yahoo: the last 30 years of Yahoo's continuous futures and indices, as always. TradingView: daily files fetched from TradingView's data feed (button below), back to 1871 for the "
+                                     "S&P 500 and to the 1970s-80s for most commodities. A market without a file comes from Yahoo. Results differ a little between the sources (different roll dates for "
+                                     "futures, wider high-low ranges for metals): test a change on both.")
+    history_start = None
+    if price_source == core.SOURCE_TV:
+        history_start = str(st.date_input("History starts", value=dt.date.fromisoformat(core.default_history_start()), min_value=dt.date(1896, 1, 1), key="w_history_start",
+                                          help="Prices are used from this date (default: the last 30 years, like Yahoo). The walk-forward uses every year from here, so an earlier start means more windows. Earlier "
+                                               "data is thinner: the S&P 500 is close-only until 1962 (the monthly points before 1950 are cut out of the files), and old futures bars often have no high-low range (the "
+                                               "engine estimates it), so results from before the 1990s are rough."))
+        st.caption("Bitcoin is used from " + core.tv_prices.LAB_START["Bitcoin"] + " (before that it cost $5-$900 and per-contract fees swamp a position). The files keep everything.")
+        tv_table = core.tv_prices.manifest()
+        if len(tv_table):
+            st.caption(f"{len(tv_table)} files, fetched {tv_table['fetched_at'].min()} to {tv_table['fetched_at'].max()}; last bar {tv_table['last'].max()}.")
+        missing_tv = [m for m in markets if m in core.tv_prices.MARKETS and not core.tv_prices.has(m)]
+        if missing_tv:
+            st.warning(f"No TradingView file here for: {', '.join(missing_tv)}. The first run downloads them from TradingView (about 10 seconds each). To skip that, put the data_tradingview folder next to the app.")
+        if st.button("Download the latest TradingView data", key="w_tv_update", icon=":material/download:", disabled=core.is_running(),
+                     help="Fetches every market's whole daily history from TradingView (about 2 minutes) and replaces the files in data_tradingview/. Delayed futures data, bars only."):
+            with st.spinner("Fetching 15 markets from TradingView (about 2 minutes)..."):
+                _, tv_failed = core.tv_prices.update_all(include_extras=False, log=lambda *_: None)
+            prices_for.clear()
+            ss["tv_update_msg"] = ("Failed: " + "; ".join(f"{n} ({e[:50]})" for n, e in tv_failed)) if tv_failed else f"Updated {len(core.tv_prices.MARKETS)} markets."
+            st.rerun()
+        if ss.get("tv_update_msg"):
+            st.caption(ss.pop("tv_update_msg"))
+        age = float("inf")
+    else:
+        age = core.cache_age_hours(markets) if markets else float("inf")
+        st.caption("Saved on disk: " + ("not yet for every market (the first run downloads them)" if not np.isfinite(age) else f"oldest {age:.1f} h old (refreshed after {core.CACHE_HOURS} h)"))
+    refresh = st.checkbox("Download fresh prices on the next run", value=False, key="w_refresh", disabled=price_source == core.SOURCE_TV, help="Yahoo source only.")
 
 # ------------------------------------------------------------------------------------------------------------------------------------ the strategy (shared by the backtest and the walk-forward)
 for key, _, _, default, default_text, _ in core.PARAMS:
@@ -83,7 +132,7 @@ for key, _, _, default, default_text, _ in core.PARAMS:
     ss.setdefault(f"p_r_{key}", default_text)
 ss.setdefault("p_v_risk", core.RISK_DEFAULT)
 with st.expander("The strategy: numbers, what the walk-forward searches, copy / paste", expanded=True):
-    st.caption("'Value' is what the backtest uses, and what the walk-forward holds a setting at when it is not ticked. 'Search it' and 'Values to try' only matter to the walk-forward.")
+    st.caption("'Value' is what the backtest uses, and what the optimizer and the walk-forward hold a setting at when it is not ticked. 'Search it' and 'Values to try' only matter to the optimizer and the walk-forward.")
     head = st.columns([2.6, 0.7, 1.1, 2.6])
     head[1].caption("Search it")
     head[2].caption("Value")
@@ -129,7 +178,7 @@ with st.expander("The strategy: numbers, what the walk-forward searches, copy / 
             ss["pending_clear_paste"] = True
             st.rerun()
 
-mode = st.radio("Mode", ["Backtest", "Walk-forward"], horizontal=True, key="mode", label_visibility="collapsed")
+mode = st.radio("Mode", ["Backtest", "Optimizer", "Walk-forward"], horizontal=True, key="mode", label_visibility="collapsed")
 running = core.is_running()
 
 
@@ -165,7 +214,78 @@ def equity_view(curve, bh, name, key, csv_name):
     st.download_button("Download the equity curve (CSV)", frame.to_csv().encode(), csv_name, "text/csv", key=f"{key}_dl")
 
 
-def positions_view(chart_data, key, run_id, note):
+def tv_files_stamp() -> str:
+    """Changes when the TradingView files are refreshed (part of the price cache key)."""
+    return ";".join(f"{m}:{int(os.path.getmtime(core.tv_prices.file_for(m)))}" for m in core.tv_prices.MARKETS if core.tv_prices.has(m))
+
+
+def heatmap(matrix: pd.DataFrame, key: str):
+    """Years down, months (or quarters) across, each cell coloured by its return (green up, red down) and labelled in %. `matrix` is core.period_matrix()."""
+    cols = list(matrix.columns)
+    long = matrix.reset_index().melt("year", var_name="period", value_name="ret").dropna()
+    long["pct"] = long["ret"] * 100
+    long["label"] = long["pct"].map(lambda v: f"{v:.1f}")
+    limit = float(max(np.nanpercentile(np.abs(long["pct"]), 90), 1.0)) if len(long) else 1.0
+    base = alt.Chart(long).encode(x=alt.X("period:N", sort=cols, title=None, axis=alt.Axis(orient="top", labelAngle=0)), y=alt.Y("year:O", title=None))
+    rect = base.mark_rect().encode(color=alt.Color("pct:Q", scale=alt.Scale(scheme="redyellowgreen", domain=[-limit, limit], clamp=True), legend=None),
+                                   tooltip=["year:O", "period:N", alt.Tooltip("pct:Q", title="return %", format=".2f")])
+    text = base.mark_text(fontSize=11, color="#111").encode(text="label:N")
+    st.altair_chart((rect + text).properties(height=max(120, 24 * len(matrix))), width="stretch")
+
+
+def returns_view(curve, bh, key, csv_name, trades=None):
+    """Returns by period from an equity curve: yearly (tiles, bar chart, table with buy & hold, drawdown inside each year), quarterly and monthly (heat maps), and the realized P&L by market and year."""
+    period = st.radio("Period", ["Yearly", "Quarterly", "Monthly"], horizontal=True, key=f"{key}_period", label_visibility="collapsed")
+    unit = {"Yearly": "year", "Quarterly": "quarter", "Monthly": "month"}[period]
+    summary = core.return_summary(curve, unit)
+    if not summary:
+        st.info("Not enough history for period returns.")
+        return
+    label = lambda at: (f"{at}" if unit == "year" else (f"{at[0]} Q{at[1]}" if unit == "quarter" else f"{at[0]}-{at[1]:02d}"))
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric(f"Best {unit}", fmt_pct(summary["best"], 1), delta=label(summary["best_at"]), delta_color="off", border=True)
+    t2.metric(f"Worst {unit}", fmt_pct(summary["worst"], 1), delta=label(summary["worst_at"]), delta_color="off", border=True)
+    t3.metric(f"Positive {unit}s", f"{summary['positive']}/{summary['n']}", delta=f"{summary['positive'] / summary['n'] * 100:.0f}%", delta_color="off", border=True)
+    t4.metric(f"Median {unit}", fmt_pct(summary["median"], 1), delta=f"mean {summary['mean'] * 100:.1f}%", delta_color="off", border=True)
+    if unit == "year":
+        table = core.yearly_table(curve, bh)
+        shown = table.copy()
+        shown["Year"] = [f"{y}*" if p else str(y) for y, p in zip(shown["year"], shown["partial"])]
+        frame = pd.DataFrame({"Year": shown["Year"], "Strategy %": shown["return"] * 100, "Max drawdown in the year %": shown["max_dd"] * 100, "End equity $": [f"{v:,.0f}" for v in shown["end_equity"]]})
+        if bh is not None and table["bh_return"].notna().any():
+            frame.insert(2, "Equal-weight buy & hold %", table["bh_return"] * 100)
+        chart = table[["year", "return", "bh_return"]].copy()
+        chart["Strategy %"] = chart["return"] * 100
+        bars = alt.Chart(chart).mark_bar().encode(x=alt.X("year:O", title=None, axis=alt.Axis(labelAngle=-45)), y=alt.Y("Strategy %:Q", title="Return in the year (%)"),
+                                                  color=alt.condition(alt.datum["Strategy %"] >= 0, alt.value("#2ca02c"), alt.value("#d62728")),
+                                                  tooltip=["year:O", alt.Tooltip("Strategy %:Q", format=".1f")])
+        layers = bars
+        if bh is not None and table["bh_return"].notna().any():
+            chart["Buy & hold %"] = chart["bh_return"] * 100
+            layers = bars + alt.Chart(chart).mark_tick(color="#7f7f7f", thickness=3, size=18).encode(x="year:O", y="Buy & hold %:Q", tooltip=["year:O", alt.Tooltip("Buy & hold %:Q", format=".1f")])
+        st.altair_chart(layers.properties(height=300), width="stretch")
+        st.caption("Bars: the strategy. Grey ticks: equal-weight buy & hold of the same markets." if bh is not None else "Bars: the strategy.")
+        st.dataframe(frame, hide_index=True, width="stretch", column_config={"Strategy %": st.column_config.NumberColumn(format="%.1f"), "Equal-weight buy & hold %": st.column_config.NumberColumn(format="%.1f"),
+                                                                              "Max drawdown in the year %": st.column_config.NumberColumn(format="%.1f")})
+        if table["partial"].any():
+            st.caption("* an incomplete year: " + ", ".join(f"{int(r.year)} ({'to ' + r.to.strftime('%d %b') if r.year == table['year'].iloc[-1] else 'from ' + curve.index[0].strftime('%d %b')})" for r in table[table["partial"]].itertuples()))
+        st.download_button("Download the yearly returns (CSV)", frame.to_csv(index=False).encode(), csv_name, "text/csv", key=f"{key}_dl")
+    else:
+        matrix = core.period_matrix(curve, unit)
+        heatmap(matrix, key)
+        st.caption("Return of the account in each " + unit + " (%); the Year column of the table below is the calendar year.")
+        shown = (matrix * 100).round(1)
+        st.dataframe(shown, width="stretch", column_config={c: st.column_config.NumberColumn(format="%.1f") for c in shown.columns})
+        st.download_button(f"Download the {unit}ly returns (CSV)", (matrix * 100).round(3).to_csv().encode(), csv_name.replace("yearly", unit + "ly"), "text/csv", key=f"{key}_{unit}_dl")
+    if trades:
+        pnl = core.pnl_by_market_year(trades)
+        if len(pnl):
+            with st.expander("Realized profit and loss by market and year ($)"):
+                st.caption("Trades are counted in the year they closed, after costs. This is not the account's return: open positions' unrealized changes and the sizing of each year are not in it.")
+                st.dataframe(pnl.astype(float).apply(lambda col: col.map("{:,.0f}".format)), width="stretch")
+
+
+def positions_view(chart_data, key, run_id, note, run_settings=None):
     """The trades on one market's price chart: entry / add / take-profit / stop markers, the stepped position boxes and a line at every monthly high."""
     assets = charts.markets_with_trades(chart_data)
     if not assets:
@@ -181,7 +301,9 @@ def positions_view(chart_data, key, run_id, note):
                             help="Each trade and monthly high is its own series on the chart; drawing 25 years of them is slow, so by default only the last years are.")
     show_boxes = c3.checkbox("Position boxes", value=True, key=f"{key}_boxes")
     show_lines = c4.checkbox("Monthly-high lines", value=True, key=f"{key}_lines")
-    df = prices_for(asset)
+    rs = run_settings or {}
+    src = rs.get("price_source", "yahoo")
+    df = prices_for(asset, src, rs.get("history_start"), tv_files_stamp() if src == "tradingview" else "")
     memo = ss.setdefault("pos_memo", {})
     ck = (run_id, key, asset, int(years), show_boxes, show_lines)
     if ck not in memo:
@@ -298,18 +420,36 @@ def mc_windows_view(windows: pd.DataFrame):
             st.caption(f"90% interval: {fmt(bs['p5'])} to {fmt(bs['p95'])}")
 
 
+def show_live_panel(prefix: str):
+    """Progress bar, Stop button and live log of the run in the background (walk-forward or optimizer). Redraws itself every second, and the whole page once the run has ended."""
+    @st.fragment(run_every=1.0 if running else None)
+    def panel():
+        if not core.is_running():
+            st.rerun()                                      # finished (or failed) since the last full draw: draw the results
+            return
+        p = core.progress()
+        fraction = p["done"] / p["total"] if p["total"] else 0.0
+        eta = f" · about {p['eta']:.0f} s left" if p["eta"] else ""
+        st.progress(min(fraction, 1.0), text=f"{p['phase']} · {p['elapsed']:.0f} s{eta}")
+        if st.button("Stop", key=f"{prefix}_stop", icon=":material/stop:", help="Ends the run; what has already finished is kept."):
+            core.cancel_run()
+        with st.expander("Live log"):
+            st.code(core.RUN["buf"].getvalue()[-3000:], language=None)
+    panel()
+
+
 # ------------------------------------------------------------------------------------------------------------------------------------ BACKTEST
 def backtest_mode():
     st.subheader("Backtest")
     b1, b2, b3 = st.columns([1.2, 1.7, 2.6], vertical_alignment="bottom")
-    start = b1.date_input("Test from", value=dt.date(2005, 1, 1), min_value=dt.date(1990, 1, 1), key="bt_start", help="Trading starts on this date; the indicators use all the history before it.")
+    start = b1.date_input("Test from", value=dt.date(2005, 1, 1), min_value=dt.date(1896, 1, 1), key="bt_start", help="Trading starts on this date; the indicators use all the history before it.")
     go = b2.button("Run backtest", type="primary", icon=":material/play_arrow:", key="bt_run", disabled=running or not markets)
     if running:
-        b3.caption("A walk-forward is running: the backtest waits for it.")
+        b3.caption("A walk-forward or optimizer run is in progress: the backtest waits for it.")
     if go:
         with st.spinner("Running the backtest..."):
-            ss["bt_result"] = core.run_backtest({"markets": list(markets), "capital": float(capital), "costs": costs, "margin_calls": bool(margin_calls), "exposure_pct": float(exposure),
-                                                  "max_risk_pct": float(max_risk), "start": str(start), "refresh": bool(refresh), "values": dict(values)})
+            ss["bt_result"] = core.run_backtest({"markets": list(markets), "capital": float(capital), "costs": costs, "margin_calls": bool(margin_calls), "take_min_one": bool(take_min), "margin_slice": bool(margin_slice), "contract_size": contract_size, "exposure_pct": float(exposure),
+                                                  "max_risk_pct": float(max_risk), "start": str(start), "refresh": bool(refresh), "price_source": price_source, "history_start": history_start, "values": dict(values)})
     res = ss.get("bt_result")
     if res is None:
         st.info("Set the numbers above and press Run backtest (about 5 seconds for 15 markets). The first run downloads prices; after that they come from disk.")
@@ -319,7 +459,8 @@ def backtest_mode():
         st.code(res["error"], language=None)
         return
     s = res["settings"]
-    st.caption(f"{len(s['markets'])} markets from {s['start']} · {s['costs']} · ${s['capital']:,.0f} account · {core.format_for_tradingview(s['values'])}")
+    st.caption(f"{len(s['markets'])} markets from {s['start']} · {s['costs']}" + (f" · {s.get('contract_size', 'micro')} contracts" if s["costs"] == core.COST_IBKR else "")
+               + f" · ${s['capital']:,.0f} account · {core.data_caption(res.get('data_info'))} · {core.format_for_tradingview(s['values'])}")
     for note in res["notes"][:3]:
         st.caption(note)
     stat_tiles(res["stats"], res["bh_stats"])
@@ -330,9 +471,11 @@ def backtest_mode():
         u2.metric("Win rate", fmt_pct(ep["Win Rate"], 0), border=True)
         u3.metric("Profit factor", "n/a" if not np.isfinite(ep["Profit Factor"]) else f"{ep['Profit Factor']:.2f}", border=True)
         u4.metric("Average R", "n/a" if not np.isfinite(ep["Avg R"]) else f"{ep['Avg R']:.2f}", border=True)
-    view = st.radio("View", ["Equity", "Markets", "Trades", "Positions", "Monte Carlo"], horizontal=True, key="bt_view", label_visibility="collapsed")
+    view = st.radio("View", ["Equity", "Returns", "Markets", "Trades", "Positions", "Monte Carlo"], horizontal=True, key="bt_view", label_visibility="collapsed")
     if view == "Equity":
         equity_view(res["curve"], res["bh"], "Strategy", "bt_eq", "mh_backtest_equity.csv")
+    elif view == "Returns":
+        returns_view(res["curve"], res["bh"], "bt_ret", "mh_backtest_yearly_returns.csv", res["trades"])
     elif view == "Markets":
         st.dataframe(res["assets"], hide_index=True, width="stretch")
         st.caption("Profit and loss by market (the trades' own results, after costs).")
@@ -346,7 +489,7 @@ def backtest_mode():
         else:
             st.caption("No trades.")
     elif view == "Positions":
-        positions_view(res["chart_data"], "bt_pos", id(res), "Every trade of the backtest on the market's price history. The monthly-high lines use the numbers above.")
+        positions_view(res["chart_data"], "bt_pos", id(res), "Every trade of the backtest on the market's price history. The monthly-high lines use the numbers above.", res["settings"])
     else:
         mc_series_view(res["curve"], "bt_mc")
 
@@ -376,19 +519,21 @@ def settings_from_walkforward(res, choice: str) -> dict:
 def walkforward_mode():
     st.subheader("Walk-forward")
     w1, w2, w3, w4 = st.columns(4)
-    train_years = w1.number_input("Train years", 1, 20, 4, 1, key="w_train", help="Each window searches the best settings on this many past years ...")
-    test_years = w2.number_input("Test years", 1, 10, 1, 1, key="w_test", help="... and trades them on the next stretch of this many years, which the search never saw.")
-    trials = w3.number_input("Trials per window", 5, 2000, 40, 5, key="w_trials", help="How many settings combinations each window tries. More = slower and a better search; 20-60 is a quick look, 150+ is thorough.")
-    rank_metric = w4.selectbox("Rank by", ["sharpe", "calmar", "cagr", "total_return"], key="w_rank", help="The number that picks each window's winner.")
+    train_years = w1.number_input("Train years", 1, 20, BD.TRAIN_YEARS, 1, key="w_train", help="Each window searches the best settings on this many past years ...")
+    test_years = w2.number_input("Test years", 1, 10, BD.TEST_YEARS, 1, key="w_test", help="... and trades them on the next stretch of this many years, which the search never saw.")
+    trials = w3.number_input("Trials per window", 5, 2000, BD.TRIALS, 5, key="w_trials", help="How many settings combinations each window tries. More = slower and a better search; 20-60 is a quick look, 150+ is thorough.")
+    rank_metric = w4.selectbox("Rank by", ["sharpe", "sortino", "calmar", "cagr", "total_return"], key="w_rank", index=["sharpe", "sortino", "calmar", "cagr", "total_return"].index(BD.RANK_METRIC),
+                               help="The number that picks each window's winner. Sortino = like Sharpe but only the downside swings count as risk.")
     x1, x2, x3, x4 = st.columns(4)
-    search_method = x1.selectbox("Search method", ["optuna", "random"], key="w_method", help="Optuna learns from the trials so far (better on the same budget); random is blind.")
-    anchored = x2.checkbox("Expanding train window", value=False, key="w_anchored", help="Off: the train window slides. On: it always starts at the earliest data.")
-    warm_start = x3.checkbox("Fast simulation start", value=True, key="w_warm", help="Simulates only from 3 years before each window instead of from the first bar of the data: much faster, same result.")
-    pick_middle = x4.checkbox("Pick the middle of the top N", value=False, key="w_middle", help="Instead of the single best trial, take the one in the middle of the N best (less likely to be a lucky outlier).")
+    search_method = x1.selectbox("Search method", ["optuna", "random"], key="w_method", index=["optuna", "random"].index(BD.SEARCH_METHOD), help="Optuna learns from the trials so far (better on the same budget); random is blind.")
+    anchored = x2.checkbox("Expanding train window", value=BD.ANCHORED, key="w_anchored", help="Off: the train window slides. On: it always starts at the earliest data.")
+    warm_start = x3.checkbox("Fast simulation start", value=BD.WARM_START, key="w_warm", help="Simulates only from 3 years before each window instead of from the first bar of the data: much faster, same result.")
+    pick_middle = x4.checkbox("Pick the middle of the top N", value=BD.PICK_MIDDLE, key="w_middle", help="Instead of the single best trial, take the one in the middle of the N best (less likely to be a lucky outlier).")
     y1, y2, y3, _ = st.columns(4)
-    top_n = y1.number_input("N", 3, 100, 10, 1, key="w_topn", disabled=not pick_middle)
-    workers = y2.number_input("Worker processes (0 = automatic)", 0, 64, 0, 1, key="w_workers", help="Windows run in parallel, one per process.")
-    seed = y3.number_input("Random seed", 0, 100000, 42, 1, key="w_seed")
+    top_n = y1.number_input("N", 3, 100, BD.TOP_N, 1, key="w_topn", disabled=not pick_middle)
+    workers = y2.number_input("Worker processes (0 = automatic)", 0, 64, 2 if ON_CLOUD else 0, 1, key="w_workers",
+                              help="Windows run in parallel, one per process. Automatic uses every core of the machine minus one; on Streamlit Community Cloud (a small shared machine) it starts at 2.")
+    seed = y3.number_input("Random seed", 0, 100000, BD.SEED, 1, key="w_seed")
     b1, b2 = st.columns([1, 3])
     go = b1.button("Run walk-forward", type="primary", icon=":material/play_arrow:", key="w_run", disabled=running or not markets or bool(setting_errors))
     if not markets:
@@ -397,43 +542,33 @@ def walkforward_mode():
         b2.caption("No setting is ticked for search: every window will use the same numbers.")
     if go:
         problem = core.start_run({
-            "markets": list(markets), "capital": float(capital), "costs": costs, "margin_calls": bool(margin_calls), "exposure_pct": float(exposure), "max_risk_pct": float(max_risk),
-            "refresh": bool(refresh), "train_years": int(train_years), "test_years": int(test_years), "anchored": bool(anchored), "trials": int(trials), "rank_metric": rank_metric,
+            "markets": list(markets), "capital": float(capital), "costs": costs, "margin_calls": bool(margin_calls), "take_min_one": bool(take_min), "margin_slice": bool(margin_slice), "contract_size": contract_size, "exposure_pct": float(exposure),
+            "max_risk_pct": float(max_risk), "refresh": bool(refresh), "price_source": price_source, "history_start": history_start, "train_years": int(train_years), "test_years": int(test_years), "anchored": bool(anchored), "trials": int(trials), "rank_metric": rank_metric,
             "search_method": search_method, "pick_middle": bool(pick_middle), "top_n": int(top_n), "warm_start": bool(warm_start), "workers": int(workers), "seed": int(seed),
             "values": dict(values), "searched": dict(searched), "candidates": dict(candidates)})
         if problem:
             st.warning(problem)
         st.rerun()
 
-    @st.fragment(run_every=1.0 if running else None)
-    def live_panel():
-        if not core.is_running():
-            st.rerun()                                      # finished (or failed) since the last full draw: draw the results
-            return
-        p = core.progress()
-        fraction = p["done"] / p["total"] if p["total"] else 0.0
-        eta = f" · about {p['eta']:.0f} s left" if p["eta"] else ""
-        st.progress(min(fraction, 1.0), text=f"{p['phase']} · {p['elapsed']:.0f} s{eta}")
-        if st.button("Stop", key="w_stop", icon=":material/stop:", help="Ends the run; the windows already finished are kept."):
-            core.cancel_run()
-        with st.expander("Live log"):
-            st.code(core.RUN["buf"].getvalue()[-3000:], language=None)
-
+    mine = core.run_kind() == "walkforward"                     # the last run was a walk-forward (not an optimizer search)
     if running:
-        live_panel()
-    if core.RUN["error"]:
+        if mine:
+            show_live_panel("w")
+        else:
+            st.info("The optimizer is running: follow it in the Optimizer mode. A walk-forward can start when it is done.")
+    if mine and core.RUN["error"]:
         st.error("The run failed:")
         st.code(core.RUN["error"], language=None)
-    res = core.RUN["result"]
+    res = core.RUN["result"] if mine else None
     if res is None or running:
-        if res is None and not running and not core.RUN["error"]:
+        if res is None and not running and not (mine and core.RUN["error"]):
             st.info("Set the strategy and the walk-forward above, then press Run. The first run downloads prices (about a minute); after that they come from disk.")
         return
     s = res["settings"]
     elapsed = (core.RUN["t1"] or 0) - (core.RUN["t0"] or 0)
     st.markdown("#### Result")
     st.caption(f"{len(s['markets'])} markets · {s['train_years']}y train / {s['test_years']}y test · {s['trials']} trials per window ({s['search_method']}, ranked by {s['rank_metric']}) · "
-               f"{s['costs']} · ${s['capital']:,.0f} account · finished in {elapsed:.0f} s")
+               f"{s['costs']} · ${s['capital']:,.0f} account · {core.data_caption(res.get('data_info'))} · finished in {elapsed:.0f} s")
     stats, bh_stats, curve, bh, summary = res["stats"], res["bh_stats"], res["curve"], res["bh"], res["summary"]
     if stats is None:
         st.warning("No window produced an out-of-sample result (see the log).")
@@ -446,10 +581,14 @@ def walkforward_mode():
                   help="Compounded out-of-sample CAGR divided by the average in-sample CAGR: how much of what the search found survived on unseen data. About 0.5 or more is reasonable; near 0 or below means the search found noise.")
         u4.metric("Sharpe in → out", f"{summary.get('mean_is_sharpe', float('nan')):.2f} → {summary.get('mean_oos_sharpe', float('nan')):.2f}", border=True,
                   help="Mean Sharpe in-sample, then out-of-sample. A big drop is the overfitting signature.")
-    view = st.radio("View", ["Equity", "Windows", "Settings", "Positions", "Monte Carlo", "Log"], horizontal=True, key="wf_view", label_visibility="collapsed")
+    view = st.radio("View", ["Equity", "Returns", "Windows", "Settings", "Positions", "Monte Carlo", "Log"], horizontal=True, key="wf_view", label_visibility="collapsed")
     if view == "Equity":
         if curve is not None:
             equity_view(curve, bh, "Strategy (out of sample)", "wf_eq", "mh_walkforward_oos_equity.csv")
+    elif view == "Returns":
+        if curve is not None:
+            st.caption("Out-of-sample returns: the stitched curve of every window's unseen test stretch.")
+            returns_view(curve, bh, "wf_ret", "mh_walkforward_oos_yearly_returns.csv")
     elif view == "Windows":
         if len(res["windows"]):
             st.dataframe(res["windows"], hide_index=True, width="stretch",
@@ -475,7 +614,7 @@ def walkforward_mode():
             st.caption("No window picked settings.")
     elif view == "Positions":
         positions_view(res["chart_data"], "wf_pos", id(res), "Every window's own out-of-sample trades on the market's price history. Each window traded its OWN chosen settings, so a change in style partway "
-                                                           "through is expected; each window's monthly-high lines use that window's numbers.")
+                                                           "through is expected; each window's monthly-high lines use that window's numbers.", res["settings"])
     elif view == "Monte Carlo":
         mc_windows_view(res["windows"])
         st.markdown("**Across days: the stitched out-of-sample equity curve**")
@@ -485,7 +624,89 @@ def walkforward_mode():
         st.code(res["log"][-12000:], language=None)
 
 
+# ------------------------------------------------------------------------------------------------------------------------------------ OPTIMIZER
+def optimizer_mode():
+    st.subheader("Optimizer")
+    st.caption("Tries many combinations of the settings ticked 'Search it' on ONE stretch of history and ranks them. What it shows is IN-SAMPLE: the search saw all of this history, so these numbers are the best this "
+               "strategy could have done there, not what it will do. The walk-forward is the test of whether a pick holds up on data the search never saw.")
+    o1, o2, o3, o4 = st.columns(4)
+    start = o1.date_input("Optimize from", value=dt.date(2005, 1, 1), min_value=dt.date(1896, 1, 1), key="opt_start",
+                          help="Every trial trades from this date to the last bar; the indicators use all the history before it (the same as the backtest's 'Test from', so a trial and a backtest with its numbers match).")
+    trials = o2.number_input("Trials", 5, 3000, 100, 10, key="opt_trials", help="How many settings combinations are simulated. 50-100 is a quick look, 300+ is thorough. Each one is a full backtest of the account.")
+    rank_metric = o3.selectbox("Rank by", ["sharpe", "sortino", "calmar", "cagr", "total_return"], key="opt_rank",
+                               help="The number the search tries to push up and the table is sorted by. Sortino = like Sharpe but only the downside swings count as risk.")
+    seed = o4.number_input("Random seed", 0, 100000, 42, 1, key="opt_seed")
+    p1, p2 = st.columns([1, 3])
+    workers = p1.number_input("Worker processes (0 = automatic)", 0, 64, 2 if ON_CLOUD else 0, 1, key="opt_workers",
+                              help="Trials run in parallel, one per process. Automatic uses every core of the machine minus one; on Streamlit Community Cloud (a small shared machine) it starts at 2.")
+    b1, b2 = st.columns([1, 3])
+    go = b1.button("Run optimizer", type="primary", icon=":material/play_arrow:", key="opt_run", disabled=running or not markets or bool(setting_errors) or sum(searched.values()) == 0)
+    if not markets:
+        b2.caption("Pick at least one market in the sidebar.")
+    elif sum(searched.values()) == 0:
+        b2.caption("Tick 'Search it' for at least one setting in the strategy panel above.")
+    if go:
+        ss.pop("opt_table", None)                                  # a new result set: forget the old row choice
+        problem = core.start_run({
+            "kind": "optimize", "markets": list(markets), "capital": float(capital), "costs": costs, "margin_calls": bool(margin_calls), "take_min_one": bool(take_min), "margin_slice": bool(margin_slice),
+            "contract_size": contract_size, "exposure_pct": float(exposure), "max_risk_pct": float(max_risk), "refresh": bool(refresh), "price_source": price_source, "history_start": history_start, "start": str(start), "trials": int(trials),
+            "rank_metric": rank_metric, "seed": int(seed), "workers": int(workers), "values": dict(values), "searched": dict(searched), "candidates": dict(candidates)})
+        if problem:
+            st.warning(problem)
+        st.rerun()
+
+    mine = core.run_kind() == "optimize"
+    if running:
+        if mine:
+            show_live_panel("opt")
+        else:
+            st.info("A walk-forward is running: follow it in the Walk-forward mode. The optimizer can start when it is done.")
+    if mine and core.RUN["error"]:
+        st.error("The run failed:")
+        st.code(core.RUN["error"], language=None)
+    res = core.RUN["result"] if mine else None
+    if res is None or running:
+        if res is None and not running and not (mine and core.RUN["error"]):
+            st.info("Tick the settings to search in the strategy panel above, then press Run. The first run downloads prices (about a minute); after that they come from disk.")
+        return
+    s = res["settings"]
+    elapsed = (core.RUN["t1"] or 0) - (core.RUN["t0"] or 0)
+    st.markdown("#### Result")
+    st.caption(f"{len(s['markets'])} markets from {s['start']} · {s['trials']} trials ranked by {s['rank_metric']} · {res['n_valid']} gave a result, {res['n_failed']} did not (no trades) · "
+               f"{s['costs']} · ${s['capital']:,.0f} account · {core.data_caption(res.get('data_info'))} · finished in {elapsed:.0f} s. In-sample.")
+    if not res["ranked"]:
+        st.warning("No trial produced a result (see the log).")
+        with st.expander("Log"):
+            st.code(res["log"][-12000:], language=None)
+        return
+    st.markdown("**Choose a trial** - click a row. With none chosen, the best one is used.")
+    fmt2 = st.column_config.NumberColumn(format="%.2f")
+    event = st.dataframe(res["table"], hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="opt_table",
+                         column_config={"Sharpe": fmt2, "Sortino": fmt2, "Calmar": fmt2, "CAGR %": st.column_config.NumberColumn(format="%.1f"), "Max DD %": st.column_config.NumberColumn(format="%.1f")})
+    clicked = event.selection.rows if event is not None else []
+    pick = clicked[0] if clicked and clicked[0] < len(res["ranked"]) else 0
+    best = res["ranked"][pick]
+    st.subheader(f"Trial ranked {pick + 1} of {len(res['ranked'])}")
+    stat_tiles({"CAGR": best["cagr"], "Max Drawdown": best["max_dd"], "Sharpe": best["sharpe"], "Final Equity": best["final_equity"]}, None)
+    u1, u2, u3 = st.columns(3)
+    u1.metric("Sortino", f"{best['sortino']:.2f}", border=True)
+    u2.metric("Calmar", f"{best['calmar']:.2f}", border=True)
+    u3.metric("Trades", f"{best['total_trades']:,}", border=True)
+    chosen = core.trial_settings(best["params"], s["values"]["risk_per_trade_pct"])
+    t1, t2 = st.columns(2)
+    t1.code(core.format_settings(chosen), language="json", wrap_lines=True)
+    t2.code(core.format_for_tradingview(chosen), language=None, wrap_lines=True)
+    if st.button("Use these numbers in the Backtest", key="opt_send", icon=":material/arrow_forward:", help="Puts them in the strategy panel at the top and switches to the Backtest."):
+        ss["pending_values"] = chosen
+        ss["pending_mode"] = "Backtest"
+        st.rerun()
+    with st.expander("Log"):
+        st.code(res["log"][-12000:], language=None)
+
+
 if mode == "Backtest":
     backtest_mode()
+elif mode == "Optimizer":
+    optimizer_mode()
 else:
     walkforward_mode()

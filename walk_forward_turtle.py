@@ -110,7 +110,7 @@ SIM_WARMUP_YEARS = 3       # simulate from (train_start - this many years); None
 ONLY_OPTIMIZE = None
 FIXED_VALUES = None
 
-RANK_METRIC = "sharpe"        # "sharpe", "calmar", "cagr", "total_return" -- the objective Optuna
+RANK_METRIC = "sharpe"        # "sharpe", "sortino", "calmar", "cagr", "total_return" -- the objective Optuna
                                 # maximizes and the metric that selects each window's winner
 PICK_MIDDLE_OF_TOP_N = 1      # 1 = take the single best trial. N > 1 = take the top N by
                                 # RANK_METRIC and use the one in the MIDDLE of that group (rank
@@ -216,7 +216,7 @@ def _run_window_trial_portfolio(raw_data: dict, params: dict, ath_references: di
         stats = td.performance_stats(window_equity, baseline)
     except Exception:
         return None
-    rank_stats_key = {"sharpe": "Sharpe", "calmar": "Calmar", "cagr": "CAGR",
+    rank_stats_key = {"sharpe": "Sharpe", "sortino": "Sortino", "calmar": "Calmar", "cagr": "CAGR",
                         "total_return": "Total Return"}[RANK_METRIC]
     if not np.isfinite(stats.get(rank_stats_key, np.nan)):
         return None
@@ -228,8 +228,9 @@ def _run_window_trial_portfolio(raw_data: dict, params: dict, ath_references: di
     result = {
         "params": dict(params),
         "sharpe": stats["Sharpe"], "calmar": stats["Calmar"] if np.isfinite(stats["Calmar"]) else 0.0,
+        "sortino": stats["Sortino"] if np.isfinite(stats["Sortino"]) else 0.0,
         "cagr": stats["CAGR"], "total_return": stats["Total Return"], "max_dd": stats["Max Drawdown"],
-        "per_asset_metric": {name: {"sharpe": np.nan, "calmar": np.nan, "cagr": np.nan,
+        "per_asset_metric": {name: {"sharpe": np.nan, "sortino": np.nan, "calmar": np.nan, "cagr": np.nan,
                                        "total_return": np.nan, "max_dd": np.nan}
                                 for name in raw_data},
         "per_asset_trades": per_asset_trades,
@@ -319,7 +320,7 @@ def run_window_trial(raw_data: dict, params: dict, ath_references: dict,
 
     opt.apply_params(params)
     features_fn = features_fn or _default_features_fn(ath_references)
-    rank_stats_key = {"sharpe": "Sharpe", "calmar": "Calmar", "cagr": "CAGR",
+    rank_stats_key = {"sharpe": "Sharpe", "sortino": "Sortino", "calmar": "Calmar", "cagr": "CAGR",
                         "total_return": "Total Return"}[RANK_METRIC]
 
     results, features_by_asset = {}, {}
@@ -352,6 +353,7 @@ def run_window_trial(raw_data: dict, params: dict, ath_references: dict,
         name: {
             "sharpe": per_asset_stats[name]["Sharpe"],
             "calmar": per_asset_stats[name]["Calmar"] if np.isfinite(per_asset_stats[name]["Calmar"]) else 0.0,
+            "sortino": per_asset_stats[name]["Sortino"] if np.isfinite(per_asset_stats[name]["Sortino"]) else 0.0,
             "cagr": per_asset_stats[name]["CAGR"],
             "total_return": per_asset_stats[name]["Total Return"],
             "max_dd": per_asset_stats[name]["Max Drawdown"],
@@ -364,19 +366,20 @@ def run_window_trial(raw_data: dict, params: dict, ath_references: dict,
 
     score_sharpe = aggregate("sharpe")
     score_calmar = aggregate("calmar")
+    score_sortino = aggregate("sortino")
     score_cagr = aggregate("cagr")
     score_total_return = aggregate("total_return")
     # aggregate("sharpe") can still be NaN here even after the per-asset gate (plain mean/median/
     # min propagate NaN from any INCLUDED asset whose own Sharpe was non-finite), so check
     # whichever score RANK_METRIC actually ranks by.
-    score_by_rank_metric = {"sharpe": score_sharpe, "calmar": score_calmar, "cagr": score_cagr,
+    score_by_rank_metric = {"sharpe": score_sharpe, "sortino": score_sortino, "calmar": score_calmar, "cagr": score_cagr,
                               "total_return": score_total_return}[RANK_METRIC]
     if not np.isfinite(score_by_rank_metric):
         return None
 
     result = {
         "params": dict(params),
-        "sharpe": score_sharpe, "calmar": score_calmar,
+        "sharpe": score_sharpe, "calmar": score_calmar, "sortino": score_sortino,
         "cagr": score_cagr, "total_return": score_total_return,
         "max_dd": min(per_asset_metric[name]["max_dd"] for name in valid_assets),
         "per_asset_metric": per_asset_metric, "per_asset_trades": per_asset_trades,
@@ -398,7 +401,7 @@ def run_window_trial(raw_data: dict, params: dict, ath_references: dict,
 # IN-SAMPLE SEARCH (one window): Optuna or random
 # ----------------------------------------------------------------------------
 def _metric_key() -> str:
-    return {"sharpe": "sharpe", "calmar": "calmar", "cagr": "cagr", "total_return": "total_return"}[RANK_METRIC]
+    return {"sharpe": "sharpe", "sortino": "sortino", "calmar": "calmar", "cagr": "cagr", "total_return": "total_return"}[RANK_METRIC]
 
 
 def _search_random(raw_is, ath_is, w, features_fn, st, seed, cancel_check):
@@ -438,7 +441,7 @@ def _search_optuna(raw_is, ath_is, w, features_fn, st, seed, cancel_check):
     study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
 
     metric_key = _metric_key()
-    rank_stats_key = {"sharpe": "Sharpe", "calmar": "Calmar", "cagr": "CAGR",
+    rank_stats_key = {"sharpe": "Sharpe", "sortino": "Sortino", "calmar": "Calmar", "cagr": "CAGR",
                         "total_return": "Total Return"}[RANK_METRIC]
     seen, results = {}, []
     counters = {"sims": 0, "failed": 0}
@@ -592,9 +595,9 @@ def _process_window_inner(wi: int, n_windows: int, w: dict) -> dict:
             "oos_curves": oos["equity_curves"], "oos_priors": oos.get("equity_priors") or {}, "chart": chart,
             "report": {
                 **w, "status": "ok", "params": best_is["params"],
-                "is_sharpe": best_is["sharpe"], "is_calmar": best_is["calmar"], "is_cagr": best_is["cagr"],
+                "is_sharpe": best_is["sharpe"], "is_calmar": best_is["calmar"], "is_cagr": best_is["cagr"], "is_sortino": best_is.get("sortino"),
                 "is_trades": best_is["total_trades"],
-                "oos_sharpe": oos["sharpe"], "oos_calmar": oos["calmar"], "oos_cagr": oos["cagr"],
+                "oos_sharpe": oos["sharpe"], "oos_calmar": oos["calmar"], "oos_cagr": oos["cagr"], "oos_sortino": oos.get("sortino"),
                 "oos_max_dd": oos["max_dd"], "oos_trades": oos["total_trades"]}}
 
 

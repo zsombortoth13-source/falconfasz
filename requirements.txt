@@ -1,6 +1,8 @@
-streamlit
-pandas
-numpy
-yfinance
-altair
-streamlit-lightweight-charts
+streamlit>=1.50
+pandas>=2.2
+numpy>=2.0
+scipy>=1.11
+optuna>=3.6
+yfinance>=0.2.40
+altair>=5.0
+streamlit-lightweight-charts>=0.7.20

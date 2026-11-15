@@ -85,7 +85,8 @@ NARROW_WINDOW = 1   # how many neighboring candidate values to include around wh
 # WORSE than a single blind search would have -- at worst it ties it.
 STAGE2_BLIND_FRACTION = 0.4
 
-RANK_METRIC = "sharpe"   # "sharpe", "calmar", "cagr", "total_return"
+RANK_METRIC = "sharpe"   # "sharpe", "sortino", "calmar", "cagr", "total_return"
+FEATURE_START = None     # a date: every trial trades only from this date (the indicators still use all the history before it), exactly like a backtest that starts there. None = from the first bar.
 
 # HOW to combine each asset's own normalized performance into one score for ranking.
 # "mean": average across assets -- a good overall trial can still be pulled up by one
@@ -406,7 +407,7 @@ def _run_trial_portfolio(features: dict, params: dict) -> dict | None:
         return None
     # Gated on whichever metric RANK_METRIC actually ranks by, not always Sharpe -- same reasoning
     # as the per-asset path's own fix (see run_trial above).
-    rank_stats_key = {"sharpe": "Sharpe", "calmar": "Calmar", "cagr": "CAGR",
+    rank_stats_key = {"sharpe": "Sharpe", "sortino": "Sortino", "calmar": "Calmar", "cagr": "CAGR",
                         "total_return": "Total Return"}[RANK_METRIC]
     if not np.isfinite(stats.get(rank_stats_key, np.nan)):
         return None
@@ -419,8 +420,9 @@ def _run_trial_portfolio(features: dict, params: dict) -> dict | None:
     return {
         "params": dict(params),
         "sharpe": stats["Sharpe"], "calmar": stats["Calmar"] if np.isfinite(stats["Calmar"]) else 0.0,
+        "sortino": stats["Sortino"] if np.isfinite(stats["Sortino"]) else 0.0,
         "cagr": stats["CAGR"], "total_return": stats["Total Return"],
-        "per_asset_metric": {name: {"sharpe": np.nan, "calmar": np.nan, "cagr": np.nan, "total_return": np.nan}
+        "per_asset_metric": {name: {"sharpe": np.nan, "sortino": np.nan, "calmar": np.nan, "cagr": np.nan, "total_return": np.nan}
                                 for name in features},
         "max_dd": stats["Max Drawdown"], "final_equity": stats["Final Equity"], "total_trades": total_trades,
         "per_asset_trades": per_asset_trades, "per_system_trades": per_system_trades,
@@ -439,6 +441,12 @@ def run_trial(raw_data: dict, params: dict, ath_references: dict = None, feature
                 features[name].attrs["asset"] = name   # fee schedule lookup (td.commission_for)
         else:
             features = {name: features_fn(name, df) for name, df in raw_data.items()}
+        if FEATURE_START is not None:
+            trimmed = {}
+            for name, f in features.items():
+                trimmed[name] = f.loc[FEATURE_START:].copy()
+                trimmed[name].attrs["asset"] = name
+            features = trimmed
     except Exception:
         return None
 
@@ -472,7 +480,7 @@ def run_trial(raw_data: dict, params: dict, ath_references: dict = None, feature
     # a perfectly valid CAGR/Total Return but a non-finite Sharpe (e.g. zero-variance returns)
     # used to get silently dropped from the aggregate even when ranking by CAGR/Total Return,
     # where that asset's result was entirely usable.
-    rank_stats_key = {"sharpe": "Sharpe", "calmar": "Calmar", "cagr": "CAGR",
+    rank_stats_key = {"sharpe": "Sharpe", "sortino": "Sortino", "calmar": "Calmar", "cagr": "CAGR",
                         "total_return": "Total Return"}[RANK_METRIC]
     valid_assets = [name for name, s in per_asset_stats.items()
                     if s is not None and np.isfinite(s.get(rank_stats_key, np.nan))]
@@ -484,6 +492,7 @@ def run_trial(raw_data: dict, params: dict, ath_references: dict = None, feature
         s = per_asset_stats[name]
         per_asset_metric[name] = {
             "sharpe": s["Sharpe"], "calmar": s["Calmar"] if np.isfinite(s["Calmar"]) else 0.0,
+            "sortino": s["Sortino"] if np.isfinite(s["Sortino"]) else 0.0,
             "cagr": s["CAGR"], "total_return": s["Total Return"],
         }
 
@@ -500,6 +509,7 @@ def run_trial(raw_data: dict, params: dict, ath_references: dict = None, feature
 
     score_sharpe = aggregate("sharpe")
     score_calmar = aggregate("calmar")
+    score_sortino = aggregate("sortino")
     score_cagr = aggregate("cagr")
     score_total_return = aggregate("total_return")
 
@@ -508,7 +518,7 @@ def run_trial(raw_data: dict, params: dict, ath_references: dict = None, feature
     # be NaN here even after that gate: aggregate("sharpe") propagates NaN from any INCLUDED
     # asset whose own Sharpe happened to be non-finite despite having a perfectly valid
     # CAGR/Total Return, since plain mean/median/min don't skip NaN the way nanmean would).
-    score_by_rank_metric = {"sharpe": score_sharpe, "calmar": score_calmar, "cagr": score_cagr,
+    score_by_rank_metric = {"sharpe": score_sharpe, "sortino": score_sortino, "calmar": score_calmar, "cagr": score_cagr,
                               "total_return": score_total_return}[RANK_METRIC]
     if not np.isfinite(score_by_rank_metric):
         return None
@@ -532,7 +542,7 @@ def run_trial(raw_data: dict, params: dict, ath_references: dict = None, feature
 
     return {
         "params": dict(params),
-        "sharpe": score_sharpe, "calmar": score_calmar, "cagr": score_cagr, "total_return": score_total_return,
+        "sharpe": score_sharpe, "calmar": score_calmar, "sortino": score_sortino, "cagr": score_cagr, "total_return": score_total_return,
         "per_asset_metric": per_asset_metric,
         "max_dd": min(per_asset_stats[name]["Max Drawdown"] for name in valid_assets),   # worst single-asset drawdown
         "final_equity": combined_final_equity, "total_trades": total_trades,
@@ -713,7 +723,7 @@ _PORTFOLIO_CONFIG_ATTRS = ("PORTFOLIO_STARTING_CAPITAL", "USE_PORTFOLIO_RISK_CAP
                             "SHOCK_PAUSE_DAYS", "EXTENSION_MA", "EXTENSION_N_MULT", "EXTENSION_RISK_MULT",
                             "DAILY_LOSS_STOP_N_MULT", "DAILY_LOSS_STOP_PCT", "ENTRY_TOP_K", "ENTRY_STRENGTH_LOOKBACK",
                             "ENTRY_MIN_STRENGTH", "ENTRY_RANK_FIRST_UNIT_ONLY", "VOL_RISK_GAMMA", "VOL_RISK_ATR", "VOL_RISK_REF",
-                            "VOL_RISK_MIN", "VOL_RISK_MAX", "ENTRY_EMA_PERIOD", "ENTRY_EMA_MODE", "ENTRY_EMA_EXIT", "MH_CLEAN_MODE")
+                            "VOL_RISK_MIN", "VOL_RISK_MAX", "ENTRY_EMA_PERIOD", "ENTRY_EMA_MODE", "ENTRY_EMA_EXIT", "MH_CLEAN_MODE", "ASSET_MARGIN_SLICE")
 
 
 def current_portfolio_config() -> dict:
@@ -727,7 +737,7 @@ def current_portfolio_config() -> dict:
 
 def _init_worker(raw_data: dict, ath_references: dict = None, score_mode: str = None,
                    portfolio_config: dict = None, score_aggregation: str = None,
-                   enable_s1: bool = None, enable_s2: bool = None):
+                   enable_s1: bool = None, enable_s2: bool = None, feature_start=None):
     # score_mode / portfolio_config / score_aggregation / enable_s1 / enable_s2: explicitly
     # re-applied here, not just left to read the module-level globals -- on Windows,
     # multiprocessing.Pool uses spawn (not fork), so each worker process re-imports this module
@@ -742,7 +752,7 @@ def _init_worker(raw_data: dict, ath_references: dict = None, score_mode: str = 
     # printed "ranking metric"/"systems active" summary and the worker's ACTUAL behavior would
     # quietly disagree, every single parallel run (the default; N_WORKERS defaults > 1).
     global _worker_raw_data, _worker_ath_references, _worker_cache
-    global SCORE_MODE, SCORE_AGGREGATION, ENABLE_S1, ENABLE_S2
+    global SCORE_MODE, SCORE_AGGREGATION, ENABLE_S1, ENABLE_S2, FEATURE_START
     _worker_raw_data = raw_data
     _worker_ath_references = ath_references
     import wf_fast   # lazy: wf_fast imports this module at its own top level
@@ -758,6 +768,8 @@ def _init_worker(raw_data: dict, ath_references: dict = None, score_mode: str = 
         ENABLE_S1 = enable_s1
     if enable_s2 is not None:
         ENABLE_S2 = enable_s2
+    if feature_start is not None:
+        FEATURE_START = feature_start
 
 
 def _run_trial_worker(params: dict):
@@ -767,7 +779,7 @@ def _run_trial_worker(params: dict):
 
 def search_optuna(raw_data: dict, ath_references: dict, n_trials: int, n_workers: int,
                     only_optimize: set = None, fixed_values: dict = None, seed: int = None,
-                    progress_cb=None, label: str = "search", multivariate: bool = False) -> tuple:
+                    progress_cb=None, label: str = "search", multivariate: bool = False, cancel_check=None) -> tuple:
     """Optuna (TPE) search over the same space as sample_unique_param_sets(), maximizing the
     RANK_METRIC score. Returns (results, n_failed) in the same shape as _run_trial_batch, so
     every caller's reporting works unchanged.
@@ -778,7 +790,8 @@ def search_optuna(raw_data: dict, ath_references: dict, n_trials: int, n_workers
     The budget (n_trials) counts actual simulations: structurally invalid combinations and exact
     repeats of an already-scored parameter set are answered without re-running and don't count.
 
-    progress_cb(sims_done, n_trials, n_valid, n_failed): called after every round."""
+    progress_cb(sims_done, n_trials, n_valid, n_failed): called after every round.
+    cancel_check(): returns True to stop after the current round; the trials finished so far are returned."""
     import optuna
     import wf_fast   # lazy: wf_fast imports this module at its own top level
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -789,7 +802,7 @@ def search_optuna(raw_data: dict, ath_references: dict, n_trials: int, n_workers
                                            n_startup_trials=max(10, n_trials // 4))
     study = optuna.create_study(direction="maximize", sampler=sampler)
     pruned = optuna.trial.TrialState.PRUNED
-    metric_key = {"sharpe": "sharpe", "calmar": "calmar", "cagr": "cagr", "total_return": "total_return"}[RANK_METRIC]
+    metric_key = {"sharpe": "sharpe", "sortino": "sortino", "calmar": "calmar", "cagr": "cagr", "total_return": "total_return"}[RANK_METRIC]
 
     results, seen = [], {}
     sims = failed = asks = 0
@@ -797,11 +810,11 @@ def search_optuna(raw_data: dict, ath_references: dict, n_trials: int, n_workers
     if n_workers > 1:
         pool = mp.Pool(processes=n_workers, initializer=_init_worker,
                        initargs=(raw_data, ath_references, SCORE_MODE, current_portfolio_config(),
-                                 SCORE_AGGREGATION, ENABLE_S1, ENABLE_S2))
+                                 SCORE_AGGREGATION, ENABLE_S1, ENABLE_S2, FEATURE_START))
     else:
         _init_worker(raw_data, ath_references)
     try:
-        while sims < n_trials and asks < n_trials * 5:
+        while sims < n_trials and asks < n_trials * 5 and not (cancel_check is not None and cancel_check()):
             round_size = max(1, min(max(n_workers, 1), n_trials - sims))
             pending, to_run = [], {}
             for _ in range(round_size):
@@ -863,7 +876,7 @@ def _run_trial_batch(param_list: list, raw_data: dict, ath_references: dict, n_w
     if n_workers > 1:
         with mp.Pool(processes=n_workers, initializer=_init_worker,
                       initargs=(raw_data, ath_references, SCORE_MODE, current_portfolio_config(),
-                                 SCORE_AGGREGATION, ENABLE_S1, ENABLE_S2)) as pool:
+                                 SCORE_AGGREGATION, ENABLE_S1, ENABLE_S2, FEATURE_START)) as pool:
             for trial_num, result in enumerate(
                     pool.imap_unordered(_run_trial_worker, param_list, chunksize=1), start=1):
                 if result is None:
@@ -958,7 +971,7 @@ def main():
     print(f"\nUsing {n_workers} worker process(es) "
           f"({'parallel' if n_workers > 1 else 'sequential -- only 1 core available or N_WORKERS=1'})")
 
-    metric_key = {"sharpe": "sharpe", "calmar": "calmar", "cagr": "cagr", "total_return": "total_return"}[RANK_METRIC]
+    metric_key = {"sharpe": "sharpe", "sortino": "sortino", "calmar": "calmar", "cagr": "cagr", "total_return": "total_return"}[RANK_METRIC]
     rng = random.Random(RANDOM_SEED)
     start_time = time.time()
     results = []
@@ -1104,7 +1117,7 @@ def main():
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         all_rows = []
         for rank, r in enumerate(results, start=1):
-            row = {"rank": rank, "sharpe": r["sharpe"], "calmar": r["calmar"], "cagr": r["cagr"],
+            row = {"rank": rank, "sharpe": r["sharpe"], "sortino": r.get("sortino"), "calmar": r["calmar"], "cagr": r["cagr"],
                    "max_dd": r["max_dd"], "final_equity": r["final_equity"], "total_trades": r["total_trades"]}
             row.update(r["params"])
             all_rows.append(row)
@@ -1113,7 +1126,7 @@ def main():
         print(f"\nFull ranked results ({len(results)} trials) saved to: {csv_path}")
         return
     print(f"\n{SCORE_AGGREGATION.capitalize()}-of-per-asset score: Sharpe={best['sharpe']:.2f}, "
-          f"Calmar={best['calmar']:.2f}, CAGR={best['cagr']*100:.2f}%")
+          f"Sortino={best.get('sortino', float('nan')):.2f}, Calmar={best['calmar']:.2f}, CAGR={best['cagr']*100:.2f}%")
     print(f"Worst single-asset drawdown: {best['max_dd']*100:.2f}%")
     print(f"Combined portfolio final equity (reporting only, NOT used for ranking): ${best['final_equity']:,.0f}")
     print("\nPer-asset breakdown (this is what actually got scored):")
@@ -1149,7 +1162,7 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     all_rows = []
     for rank, r in enumerate(results, start=1):
-        row = {"rank": rank, "sharpe": r["sharpe"], "calmar": r["calmar"], "cagr": r["cagr"],
+        row = {"rank": rank, "sharpe": r["sharpe"], "sortino": r.get("sortino"), "calmar": r["calmar"], "cagr": r["cagr"],
                "max_dd": r["max_dd"], "final_equity": r["final_equity"], "total_trades": r["total_trades"]}
         for name in all_asset_names:
             row[f"sharpe_{name}"] = r["per_asset_metric"][name]["sharpe"] if name in r["per_asset_metric"] else np.nan

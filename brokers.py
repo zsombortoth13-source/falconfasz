@@ -39,6 +39,7 @@ PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brokers"
 
 SIZING_FRACTIONAL = "fractional"
 SIZING_MICRO = "micro"
+SIZING_NANO = "nano"        # a tenth of the smallest listed contract (see _synthetic_nano): most markets have no exchange-listed nano, so this is a MODEL of one
 SIZING_MINI = "mini"
 SIZING_CFD = "cfd"
 
@@ -76,16 +77,40 @@ def save(profile: dict, name: str) -> str:
 def sizing_options(profile: dict) -> list:
     """Sizing modes that make sense for this kind of broker, first = default."""
     if profile["kind"] == "futures":
-        return [SIZING_MICRO, SIZING_MINI, SIZING_FRACTIONAL]
+        return [SIZING_MICRO, SIZING_NANO, SIZING_MINI, SIZING_FRACTIONAL]
     return [SIZING_CFD, SIZING_FRACTIONAL]
+
+
+NANO_FRACTION = 0.1         # a nano is this fraction of the smallest listed contract (profile defaults "nano_fraction" overrides)
+
+
+def _synthetic_nano(profile: dict, asset: str):
+    """A modelled nano contract for `asset`: NANO_FRACTION of the smallest listed contract (the micro, else the standard one), the SAME margin percentage, and the same fee per contract
+    (profile defaults "nano_fee_factor" scales it; 1 = the fee of the smallest listed contract, a conservative choice). Flagged as an estimate. None if the asset has no contract."""
+    options = profile["instruments"].get(asset) or {}
+    base = options.get("micro") or options.get("standard")
+    if base is None:
+        return None
+    defaults = profile.get("defaults", {})
+    spec = {k: copy.deepcopy(v) for k, v in base.items() if k not in ("margin_snapshot", "estimated_fields")}
+    spec["code"] = f"{base['code']} nano"
+    spec["multiplier"] = float(base["multiplier"]) * float(defaults.get("nano_fraction", NANO_FRACTION))
+    spec["fee_per_side"] = fee_per_side(base) * float(defaults.get("nano_fee_factor", 1.0))
+    spec["verified"] = False
+    spec["synthetic_nano"] = True
+    spec["estimated_fields"] = ["multiplier", "fee_per_side"]
+    return spec
 
 
 def _contract(profile: dict, asset: str, sizing: str):
     """The futures contract spec used for `asset` under this sizing mode, or None if the profile
-    has no instrument for it. Mini and fractional use the standard / micro contract respectively."""
+    has no instrument for it. Mini and fractional use the standard / micro contract respectively;
+    nano is a stored "nano" entry if the profile has one (saved edits), else the modelled one."""
     options = profile["instruments"].get(asset)
     if not options:
         return None
+    if sizing == SIZING_NANO:
+        return options.get("nano") or _synthetic_nano(profile, asset)
     if sizing in (SIZING_MICRO, SIZING_FRACTIONAL):
         return options.get("micro") or options.get("standard")
     return options.get("standard") or options.get("micro")
@@ -155,6 +180,8 @@ def apply_edits(profile: dict, assets, sizing: str, edited_rows: dict) -> dict:
         if int(idx) >= len(rows):
             continue
         asset = rows[int(idx)]["Asset"]
+        if profile["kind"] == "futures" and sizing == SIZING_NANO:
+            profile["instruments"][asset].setdefault("nano", _synthetic_nano(profile, asset))      # store the modelled nano so the edit has somewhere to live (and can be saved)
         spec = (_contract(profile, asset, sizing) if profile["kind"] == "futures"
                 else profile["instruments"][asset])
         for column, value in changes.items():
@@ -182,7 +209,7 @@ def compile_profile(profile: dict, assets, sizing: str, margin_calls: bool = Fal
         "USE_PER_CONTRACT_FEES": False, "FEE_SCHEDULE": {}, "ASSET_COSTS": {}, "SIZE_STEP": {},
         "USE_MARGIN_CALLS": bool(margin_calls), "MARGIN_SPEC": {},
     }
-    notes, estimates, missing, partial, unlevered = [], [], [], [], []
+    notes, estimates, missing, partial, unlevered, nano_modelled = [], [], [], [], [], []
     futures = profile["kind"] == "futures"
     if futures:
         engine["USE_PER_CONTRACT_FEES"] = True
@@ -198,10 +225,12 @@ def compile_profile(profile: dict, assets, sizing: str, margin_calls: bool = Fal
                 continue
             engine["FEE_SCHEDULE"][asset] = {"multiplier": float(spec["multiplier"]),
                                              "fee_per_contract": fee_per_side(spec), "code": spec["code"]}
-            if sizing in (SIZING_MICRO, SIZING_MINI):
+            if sizing in (SIZING_MICRO, SIZING_NANO, SIZING_MINI):
                 engine["SIZE_STEP"][asset] = float(spec["multiplier"])
             if sizing == SIZING_MICRO and not profile["instruments"][asset].get("micro"):
                 notes.append(f"{asset}: no micro contract, standard {spec['code']} used")
+            if sizing == SIZING_NANO and spec.get("synthetic_nano"):
+                nano_modelled.append(asset)
             initial = min(1.0, float(spec["margin_pct"]) / 100.0 * margin_stress)
             if spec.get("maintenance_pct") is not None:       # the broker's own maintenance rate for this contract
                 maint = min(initial, float(spec["maintenance_pct"]) / 100.0 * margin_stress)
@@ -231,6 +260,9 @@ def compile_profile(profile: dict, assets, sizing: str, margin_calls: bool = Fal
         if not futures and initial >= 1.0:
             unlevered.append(asset)
 
+    if nano_modelled:
+        notes.append(f"Nano contracts: most of these markets have no exchange-listed nano, so one is MODELLED as a tenth of the smallest listed contract, with the same margin % and the same fee per "
+                     f"contract (edit the multiplier and the fee in the table: {', '.join(nano_modelled)}).")
     if unlevered:
         notes.append(f"{', '.join(unlevered)}: fully paid, no leverage. Keep total exposure at or below 100% "
                      "(switch margin calls on to enforce it).")
