@@ -128,6 +128,34 @@ def default_history_start() -> str:
     return BD.HISTORY_START
 
 
+FINGERPRINT_FILES = ("baseline_defaults.py", "brokers.py", "brokers_builtin.py", "ibkr_fees.py", "mh_walkforward_ui.py", "mh_wf_charts.py", "mh_wf_core.py", "monte_carlo.py",
+                     "optimize_turtle_dual_system.py", "turtle_dual_system.py", "tv_prices.py", "walk_forward_turtle.py", "wf_fast.py")
+
+
+def code_fingerprint() -> str:
+    """A short fingerprint of the app's own code files (line endings ignored; a missing file counts). The same files give the same fingerprint on every machine, so a cloud app and a local one
+    can be compared at a glance: a different fingerprint means a different version, or files that were not uploaded."""
+    h = hashlib.md5()
+    for name in FINGERPRINT_FILES:
+        h.update(name.encode())
+        path = os.path.join(ROOT, name)
+        h.update(open(path, "rb").read().replace(b"\r\n", b"\n") if os.path.exists(path) else b"MISSING")
+    return h.hexdigest()[:8]
+
+
+def setup_check(markets, costs: str, source: str) -> str:
+    """One line for the sidebar: the code fingerprint, where the cost profile comes from, and how many TradingView files are here."""
+    parts = [f"code {code_fingerprint()}"]
+    if costs == COST_IBKR:
+        paths = brokers.list_profiles()
+        name = next((n for n, p in paths.items() if "futures" in n.lower()), None)
+        parts.append("costs: Interactive Brokers, " + (f"{brokers.profile_source(paths[name])} profile" if name else "NO PROFILE"))
+    if source == SOURCE_TV:
+        want = [m for m in markets if m in tv_prices.MARKETS]
+        parts.append(f"TradingView files {sum(1 for m in want if tv_prices.has(m))}/{len(want)}")
+    return " · ".join(parts)
+
+
 def data_summary(prices: dict, source: str) -> dict:
     """Where a run's prices came from and how far they reach: {'source', 'first', 'last'} (the earliest first bar and the latest last bar of the markets), {} when there are none."""
     firsts = [df.index[0] for df in prices.values() if len(df)]
@@ -205,7 +233,7 @@ def clear_price_cache():
 
 # ---------------------------------------------------------------------------------------------------------------------------------- the engine set-up for a run
 def broker_profile():
-    """The first futures broker profile of the brokers folder (Interactive Brokers) and its micro-contract sizing, or (None, None)."""
+    """The first futures broker profile (Interactive Brokers: the brokers/ folder, or the copy written into brokers_builtin.py) and its micro-contract sizing, or (None, None)."""
     for name, path in brokers.list_profiles().items():
         try:
             profile = brokers.load(path)
@@ -239,7 +267,8 @@ def configure_account(s: dict, markets) -> list:
         profile, sizing = broker_profile()
         sizing = s.get("contract_size") or sizing
         if profile is None:
-            notes.append("No futures broker profile found in the brokers folder: flat % costs were used instead.")
+            raise RuntimeError("No futures broker profile found (neither the brokers/ folder nor brokers_builtin.py): the Interactive Brokers cost model cannot be built. "
+                               "Upload brokers_builtin.py, or choose another trading-cost setting.")      # never quietly swap in a different cost model
         else:
             compiled = brokers.compile_profile(profile, list(markets), sizing, margin_calls=bool(s.get("margin_calls")), margin_stress=1.0, stop_out_pct=None)
             for name, value in compiled["engine"].items():

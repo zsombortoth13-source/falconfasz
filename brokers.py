@@ -36,6 +36,7 @@ import os
 import re
 
 PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "brokers")
+BUILTIN_PREFIX = "builtin:"      # a profile path that points at a profile written into the code (brokers_builtin.py) instead of a file
 
 SIZING_FRACTIONAL = "fractional"
 SIZING_MICRO = "micro"
@@ -45,7 +46,8 @@ SIZING_CFD = "cfd"
 
 
 def list_profiles() -> dict:
-    """{profile name: file path} for every JSON profile in the brokers/ folder."""
+    """{profile name: file path} for every JSON profile in the brokers/ folder. A profile that is also written into the code (brokers_builtin.py: Interactive Brokers futures) and has no file
+    in the folder is listed with a 'builtin:' path, so an app uploaded without its brokers/ folder still has it. A file in the folder wins over the built-in copy of the same name."""
     found = {}
     if os.path.isdir(PROFILE_DIR):
         for file in sorted(os.listdir(PROFILE_DIR)):
@@ -55,12 +57,26 @@ def list_profiles() -> dict:
                     found[load(path)["name"]] = path
                 except (OSError, ValueError, KeyError):
                     continue
+    try:
+        from brokers_builtin import BUILTIN_PROFILES
+    except ImportError:
+        BUILTIN_PROFILES = {}
+    for name in BUILTIN_PROFILES:
+        found.setdefault(name, BUILTIN_PREFIX + name)
     return found
 
 
 def load(path: str) -> dict:
+    if path.startswith(BUILTIN_PREFIX):
+        from brokers_builtin import BUILTIN_PROFILES
+        return copy.deepcopy(BUILTIN_PROFILES[path[len(BUILTIN_PREFIX):]])
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def profile_source(path: str) -> str:
+    """'built-in' for a profile that comes from the code, 'file' for one from the brokers/ folder."""
+    return "built-in" if path.startswith(BUILTIN_PREFIX) else "file"
 
 
 def save(profile: dict, name: str) -> str:

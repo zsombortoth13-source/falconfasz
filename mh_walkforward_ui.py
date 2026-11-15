@@ -125,6 +125,9 @@ with st.sidebar:
         st.caption("Saved on disk: " + ("not yet for every market (the first run downloads them)" if not np.isfinite(age) else f"oldest {age:.1f} h old (refreshed after {core.CACHE_HOURS} h)"))
     refresh = st.checkbox("Download fresh prices on the next run", value=False, key="w_refresh", disabled=price_source == core.SOURCE_TV, help="Yahoo source only.")
 
+with st.sidebar:
+    st.caption("Setup check: " + core.setup_check(markets, costs, price_source))      # which code, which cost profile, how many price files: compare it with the app on your own computer
+
 # ------------------------------------------------------------------------------------------------------------------------------------ the strategy (shared by the backtest and the walk-forward)
 for key, _, _, default, default_text, _ in core.PARAMS:
     ss.setdefault(f"p_v_{key}", default)
